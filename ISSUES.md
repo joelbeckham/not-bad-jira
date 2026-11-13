@@ -1,0 +1,4 @@
+- [ ] Changing status, priority, and who knows what else opens with the keyboard shortcut, but then keyboard doesn't work there, even including esc to go back. There should be a filter box at the top which has the focus to start with. arrow keys should move up and down the list. Esc should work. Enter selects. Mouse should still work too though.
+- [ ] Status, Priority, Assignee, etc values should should be clickable with the mouse to change. They should also show their hotkey next to them. E.g. Priority (p)
+- [ ] Status should use icons as well on the list page.
+- [ ] esc should work in the comments

@@ -805,7 +805,7 @@ impl AppView {
             "demo@example.com".into(),
             "NBJ".into(),
         ));
-        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text when editing Markdown","To Do","High","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":null})}).collect();
+        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text when editing Markdown","To Do","Highest","Unassigned"),("NBJ-105","Review empty states","To Do","Lowest","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.status = "Demo workspace · sample data".into();
     }
@@ -1113,7 +1113,16 @@ fn fuzzy(query: &str, text: &str) -> bool {
         .all(|q| chars.by_ref().any(|c| c == q))
 }
 fn cell(text: String, field: &str) -> Div {
-    if field == "summary" {
+    if field == "priority" {
+        div()
+            .w(px(64.))
+            .pr_3()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(text)
+    } else if field == "summary" {
         div()
             .flex_1()
             .min_w_0()
@@ -1225,12 +1234,13 @@ impl Render for AppView {
                         )
                         .child(div().flex().gap_6().children(
                             ["status", "priority", "assignee"].map(|f| {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(muted(f))
-                                    .child(issue.field(f))
+                                let value = if f == "priority" {
+                                    crate::priority::detail_icon(issue.field(f), "detail-priority")
+                                        .into_any_element()
+                                } else {
+                                    div().child(issue.field(f)).into_any_element()
+                                };
+                                div().flex().flex_col().gap_2().child(muted(f)).child(value)
                             }),
                         ))
                         .child(div().h(px(1.)).bg(rgb(0x303744)))
@@ -1378,6 +1388,20 @@ impl Render for AppView {
                                                 .bg(rgb(if selected { 0x253348 } else { 0x191c23 }))
                                                 .cursor_pointer()
                                                 .children(columns.iter().map(|field| {
+                                                    if field == "priority" {
+                                                        return div()
+                                                            .w(px(64.))
+                                                            .pr_3()
+                                                            .flex_shrink_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(crate::priority::icon(
+                                                                issue.field(field),
+                                                                ("priority", i),
+                                                            ))
+                                                            .into_any_element();
+                                                    }
                                                     let value = if field == "key" {
                                                         issue.key.clone()
                                                     } else {
@@ -1409,6 +1433,7 @@ impl Render for AppView {
                                                             "Inter"
                                                         })
                                                         .text_color(rgb(color))
+                                                        .into_any_element()
                                                 }))
                                                 .on_click(cx.listener(
                                                     move |this, event: &ClickEvent, _, cx| {

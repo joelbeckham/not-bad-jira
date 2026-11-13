@@ -6,12 +6,13 @@ mod adf;
 mod app;
 mod config;
 mod jira;
+mod priority;
 mod store;
 fn main() {
     let started = std::time::Instant::now();
     let measure = std::env::args().any(|a| a == "--measure-startup");
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(priority::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             cx.text_system()
