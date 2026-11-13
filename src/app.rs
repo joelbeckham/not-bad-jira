@@ -1218,34 +1218,7 @@ impl Render for AppView {
                             this.stack.clear();
                             cx.notify();
                         }))
-                }))
-                .child(div().flex_1())
-                .child(
-                    Button::new("commands")
-                        .small()
-                        .label("Commands  Ctrl+K")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.palette = true;
-                            this.inputs[5].update(cx, |s, cx| {
-                                s.set_value("", window, cx);
-                                s.focus(window, cx);
-                            });
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("refresh")
-                        .small()
-                        .label(if self.loading > 0 {
-                            "Refreshing…"
-                        } else {
-                            "Refresh  R"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.refresh();
-                            cx.notify();
-                        })),
-                );
+                }));
             body = body.child(tabs);
             if let Some(key) = self.stack.last() {
                 let issue = self.store.issues.get(key).cloned().unwrap_or_default();
@@ -1697,6 +1670,58 @@ impl Render for AppView {
                         }),
                     ));
         }
+        let shortcuts = div().flex().items_center().gap_4().flex_shrink_0();
+        let shortcuts = if self.palette {
+            shortcuts
+                .child(self.shortcut_button(
+                    "footer-run",
+                    &["Enter"],
+                    "Run or open",
+                    "palette-enter",
+                    cx,
+                ))
+                .child(self.shortcut_button("footer-close", &["Esc"], "Close", "escape", cx))
+        } else if self.config.is_none() {
+            shortcuts.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(keycap("Tab"))
+                    .child(muted("Move between fields")),
+            )
+        } else if self.edit.is_some() {
+            shortcuts
+                .child(self.shortcut_button(
+                    "footer-save",
+                    &["Ctrl+Enter"],
+                    "Save",
+                    "save-edit",
+                    cx,
+                ))
+                .child(self.shortcut_button("footer-cancel", &["Esc"], "Cancel", "escape", cx))
+        } else {
+            shortcuts
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(self.shortcut_button("footer-down", &["J"], "", "j", cx))
+                        .child(self.shortcut_button("footer-up", &["K"], "", "k", cx))
+                        .child(muted("Move")),
+                )
+                .child(self.shortcut_button("footer-open", &["Enter"], "Open", "enter", cx))
+                .child(self.shortcut_button("footer-filter", &["/"], "Filter", "/", cx))
+                .child(self.shortcut_button("footer-refresh", &["R"], "Refresh", "r", cx))
+                .child(self.shortcut_button(
+                    "footer-commands",
+                    &["Ctrl+K"],
+                    "Commands",
+                    "palette",
+                    cx,
+                ))
+        };
         div()
             .size_full()
             .flex()
@@ -1745,16 +1770,16 @@ impl Render for AppView {
                     .justify_between()
                     .border_t_1()
                     .border_color(rgb(0x303744))
-                    .child(muted(self.status.clone()))
-                    .child(muted(if self.palette {
-                        "Enter  Run or open     Esc  Close"
-                    } else if self.config.is_none() {
-                        "Tab  Move between fields"
-                    } else if self.edit.is_some() {
-                        "Ctrl+Enter  Save     Esc  Cancel"
-                    } else {
-                        "J K  Move     Enter  Open     /  Filter     Ctrl+K  Commands"
-                    })),
+                    .child(
+                        muted(self.status.clone())
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .pr_4(),
+                    )
+                    .child(shortcuts),
             )
     }
 }
@@ -1786,16 +1811,85 @@ fn command_row(id: impl Into<ElementId>, label: String, hint: String, selected: 
                 .justify_between()
                 .w_full()
                 .child(label)
-                .child(
-                    div()
-                        .font_family("JetBrains Mono")
-                        .text_size(px(11.))
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(rgb(0x191c23))
-                        .text_color(rgb(0xa4afc0))
-                        .child(hint),
-                ),
+                .child(keycap(hint)),
         )
+}
+
+fn keycap(label: impl Into<SharedString>) -> Div {
+    div()
+        .h(px(20.))
+        .min_w(px(20.))
+        .px_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family("JetBrains Mono")
+        .text_size(px(11.))
+        .line_height(px(16.))
+        .rounded(px(3.))
+        .border_1()
+        .border_color(rgb(0x3b4351))
+        .bg(rgb(0x20252e))
+        .text_color(rgb(0xc3ccdb))
+        .child(label.into())
+}
+impl AppView {
+    fn shortcut_button(
+        &self,
+        id: &'static str,
+        keys: &[&str],
+        label: &'static str,
+        command: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let name = match command {
+            "j" => "Move down",
+            "k" => "Move up",
+            _ => label,
+        };
+        let content = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .children(keys.iter().map(|key| keycap((*key).to_string())));
+        let content = if label.is_empty() {
+            content
+        } else {
+            content.child(muted(label))
+        };
+        Button::new(id)
+            .ghost()
+            .small()
+            .h(px(24.))
+            .px_1p5()
+            .cursor_pointer()
+            .accessibility_label(format!("{} ({})", name, keys.join(" / ")))
+            .child(content)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                match command {
+                    "palette" => {
+                        this.palette = true;
+                        this.inputs[5].update(cx, |s, cx| {
+                            s.set_value("", window, cx);
+                            s.focus(window, cx);
+                        });
+                    }
+                    "palette-enter" => this.palette_execute(window, cx),
+                    "save-edit" => this.save_edit(window, cx),
+                    "escape" => {
+                        if this.edit.take().is_some()
+                            || this.picker.take().is_some()
+                            || this.palette
+                        {
+                            this.palette = false;
+                            this.focus.focus(window, cx);
+                        } else {
+                            this.run_command("escape", window, cx);
+                        }
+                    }
+                    _ => this.run_command(command, window, cx),
+                }
+                cx.notify();
+            }))
+    }
 }
