@@ -5,14 +5,16 @@ mod actions;
 mod adf;
 mod app;
 mod config;
+mod indicator;
 mod jira;
 mod priority;
+mod status;
 mod store;
 fn main() {
     let started = std::time::Instant::now();
     let measure = std::env::args().any(|a| a == "--measure-startup");
     gpui_kit::application()
-        .with_assets(priority::Assets)
+        .with_assets(indicator::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             cx.text_system()

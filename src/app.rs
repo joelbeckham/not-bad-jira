@@ -1113,7 +1113,7 @@ fn fuzzy(query: &str, text: &str) -> bool {
         .all(|q| chars.by_ref().any(|c| c == q))
 }
 fn cell(text: String, field: &str) -> Div {
-    if field == "priority" {
+    if field == "status" || field == "priority" {
         div()
             .w(px(64.))
             .pr_3()
@@ -1134,8 +1134,6 @@ fn cell(text: String, field: &str) -> Div {
             text,
             match field {
                 "key" => 120.,
-                "status" => 130.,
-                "priority" => 80.,
                 "assignee" | "reporter" => 160.,
                 _ => 130.,
             },
@@ -1235,8 +1233,9 @@ impl Render for AppView {
                         .child(div().flex().gap_6().children(
                             ["status", "priority", "assignee"].map(|f| {
                                 let value = if f == "priority" {
-                                    crate::priority::detail_icon(issue.field(f), "detail-priority")
-                                        .into_any_element()
+                                    crate::priority::detail(issue.field(f)).into_any_element()
+                                } else if f == "status" {
+                                    crate::status::detail(&issue.fields[f]).into_any_element()
                                 } else {
                                     div().child(issue.field(f)).into_any_element()
                                 };
@@ -1369,7 +1368,6 @@ impl Render for AppView {
                                         .map(|i| {
                                             let issue = this.store.issues.get(&keys[i]).unwrap();
                                             let selected = i == this.selected;
-                                            let status = issue.field("status");
                                             let key = issue.key.clone();
                                             let weak = cx.entity().downgrade();
                                             div()
@@ -1388,7 +1386,20 @@ impl Render for AppView {
                                                 .bg(rgb(if selected { 0x253348 } else { 0x191c23 }))
                                                 .cursor_pointer()
                                                 .children(columns.iter().map(|field| {
-                                                    if field == "priority" {
+                                                    if field == "status" || field == "priority" {
+                                                        let icon = if field == "status" {
+                                                            crate::status::icon(
+                                                                &issue.fields[field],
+                                                                ("status", i),
+                                                            )
+                                                            .into_any_element()
+                                                        } else {
+                                                            crate::priority::icon(
+                                                                issue.field(field),
+                                                                ("priority", i),
+                                                            )
+                                                            .into_any_element()
+                                                        };
                                                         return div()
                                                             .w(px(64.))
                                                             .pr_3()
@@ -1396,10 +1407,7 @@ impl Render for AppView {
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
-                                                            .child(crate::priority::icon(
-                                                                issue.field(field),
-                                                                ("priority", i),
-                                                            ))
+                                                            .child(icon)
                                                             .into_any_element();
                                                     }
                                                     let value = if field == "key" {
@@ -1413,17 +1421,7 @@ impl Render for AppView {
                                                     };
                                                     let color = match field.as_str() {
                                                         "key" => 0x91b9f7,
-                                                        "status" if status == "Done" => 0x83d4ac,
-                                                        "status" if status == "In Progress" => {
-                                                            0x91b9f7
-                                                        }
                                                         "summary" => 0xe6ebf3,
-                                                        "priority"
-                                                            if value == "High"
-                                                                || value == "Highest" =>
-                                                        {
-                                                            0xe4b77b
-                                                        }
                                                         _ => 0xa4afc0,
                                                     };
                                                     cell(value, field)
