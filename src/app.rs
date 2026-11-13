@@ -9,6 +9,7 @@ use gpui_kit::component::{
     button::ButtonVariants,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
+    tooltip::Tooltip,
 };
 use gpui_kit::*;
 use serde_json::{Value, json};
@@ -805,7 +806,7 @@ impl AppView {
             "demo@example.com".into(),
             "NBJ".into(),
         ));
-        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text when editing Markdown","To Do","Highest","Unassigned"),("NBJ-105","Review empty states","To Do","Lowest","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":null})}).collect();
+        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("NBJ-105","Review empty states","To Do","Lowest","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.status = "Demo workspace · sample data".into();
     }
@@ -1209,40 +1210,107 @@ impl Render for AppView {
                         .id("detail")
                         .track_scroll(&self.detail_scroll)
                         .overflow_y_scroll()
-                        .p_6()
+                        .px_6()
+                        .py_4()
                         .flex()
                         .flex_col()
-                        .gap_5()
-                        .child(
-                            Button::new("back")
-                                .small()
-                                .w(px(180.))
-                                .label("← Back to issues   Esc")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.stack.pop();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(muted(issue.key.clone()))
+                        .gap_4()
                         .child(
                             div()
-                                .text_size(px(26.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(issue.field("summary")),
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .pb_3()
+                                .border_b_1()
+                                .border_color(rgb(0x303744))
+                                .child(
+                                    div()
+                                        .h(px(32.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            Button::new("back")
+                                                .small()
+                                                .icon(gpui_kit::assets::IconName::ArrowLeft)
+                                                .accessibility_label("Back to issues (Esc)")
+                                                .tooltip("Back to issues (Esc)")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.stack.pop();
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .items_center()
+                                                .gap_3()
+                                                .child(
+                                                    muted(issue.key.clone())
+                                                        .font_family("JetBrains Mono")
+                                                        .text_color(rgb(0x91b9f7))
+                                                        .flex_shrink_0(),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("detail-title")
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .text_size(px(20.))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .tooltip({
+                                                            let summary = issue.field("summary");
+                                                            move |window, cx| {
+                                                                Tooltip::new(summary.clone())
+                                                                    .build(window, cx)
+                                                            }
+                                                        })
+                                                        .child(issue.field("summary")),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_5()
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .child(crate::status::detail(&issue.fields["status"]))
+                                        .child(crate::priority::detail(issue.field("priority")))
+                                        .child(
+                                            div()
+                                                .id("detail-assignee")
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_color(rgb(0xa4afc0))
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(muted("Assignee").flex_shrink_0())
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .child(issue.field("assignee")),
+                                                )
+                                                .tooltip({
+                                                    let assignee = issue.field("assignee");
+                                                    move |window, cx| {
+                                                        Tooltip::new(assignee.clone())
+                                                            .build(window, cx)
+                                                    }
+                                                }),
+                                        ),
+                                ),
                         )
-                        .child(div().flex().gap_6().children(
-                            ["status", "priority", "assignee"].map(|f| {
-                                let value = if f == "priority" {
-                                    crate::priority::detail(issue.field(f)).into_any_element()
-                                } else if f == "status" {
-                                    crate::status::detail(&issue.fields[f]).into_any_element()
-                                } else {
-                                    div().child(issue.field(f)).into_any_element()
-                                };
-                                div().flex().flex_col().gap_2().child(muted(f)).child(value)
-                            }),
-                        ))
-                        .child(div().h(px(1.)).bg(rgb(0x303744)))
                         .child(div().text_size(px(15.)).child(
                             gpui_kit::component::text::TextView::markdown(
                                 "description",

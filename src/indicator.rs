@@ -47,6 +47,7 @@ pub fn icon(
 pub fn labeled(label: String, glyph: IconName, color: u32) -> impl IntoElement {
     div()
         .h(px(20.))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .gap(px(6.))
