@@ -1,0 +1,1801 @@
+use crate::{
+    config::Config,
+    jira::{Client, Issue},
+    store::Store,
+};
+use gpui_kit::component::{
+    Sizable, TitleBar,
+    button::Button,
+    button::ButtonVariants,
+    input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, PopupMenuItem},
+};
+use gpui_kit::*;
+use serde_json::{Value, json};
+use std::{sync::mpsc, time::Duration};
+
+enum Message {
+    ConfigChanged(Result<Config, String>),
+    Connected(Result<(Client, Value), String>),
+    Tab(usize, u64, Result<Vec<Issue>, String>),
+    Detail(u64, Result<Issue, String>),
+    Saved(String, Option<Issue>, Result<Value, String>),
+    Choices(String, String, Result<Vec<(String, String)>, String>),
+}
+#[derive(Clone)]
+struct Sender {
+    tx: mpsc::Sender<(u64, Message)>,
+    epoch: u64,
+}
+impl Sender {
+    fn send(&self, message: Message) -> Result<(), Box<mpsc::SendError<(u64, Message)>>> {
+        self.tx.send((self.epoch, message)).map_err(Box::new)
+    }
+}
+pub struct AppView {
+    focus: FocusHandle,
+    config: Option<Config>,
+    client: Option<Client>,
+    store: Store,
+    inputs: Vec<Entity<InputState>>,
+    editor: Entity<zorite_editor::EditorState>,
+    summary_input: Entity<InputState>,
+    tab: usize,
+    selected: usize,
+    stack: Vec<String>,
+    status: String,
+    loading: usize,
+    tx: Sender,
+    rx: mpsc::Receiver<(u64, Message)>,
+    demo: bool,
+    edit: Option<(String, String, crate::adf::Document)>,
+    choices: Vec<(String, String)>,
+    picker: Option<String>,
+    picker_key: Option<String>,
+    palette: bool,
+    subscriptions: Vec<Subscription>,
+    create_summary: String,
+    saving: bool,
+    sort: std::collections::HashMap<usize, (String, u8)>,
+    list_scroll: UniformListScrollHandle,
+    detail_scroll: ScrollHandle,
+    import_config: Option<Config>,
+    pending_config: Option<Config>,
+    last_refresh: std::time::Instant,
+    cache_writer: mpsc::Sender<(Store, Config)>,
+    current_user: Option<Value>,
+    refresh_errors: Vec<String>,
+    revision: u64,
+    pending_refresh: bool,
+    connecting: bool,
+}
+impl AppView {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (raw_tx, rx) = mpsc::channel();
+        let tx = Sender {
+            tx: raw_tx,
+            epoch: 0,
+        };
+        let preview = std::env::args().any(|a| a == "--demo" || a == "--editor-check");
+        let legacy = if crate::config::path().exists() || preview {
+            None
+        } else {
+            crate::config::legacy()
+        };
+        let defaults = legacy
+            .as_ref()
+            .map(|(c, t)| {
+                vec![
+                    c.jira.base_url.clone(),
+                    c.jira.email.clone(),
+                    t.clone(),
+                    c.jira.default_project.clone(),
+                    String::new(),
+                    String::new(),
+                ]
+            })
+            .unwrap_or_else(|| vec![String::new(); 6]);
+        let inputs = [
+            "https://yourcompany.atlassian.net",
+            "you@company.com",
+            "API token",
+            "Default project (optional)",
+            "Filter issues…",
+            "Search commands or jump to an issue…",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(*p)
+                    .masked(i == 2)
+                    .default_value(defaults[i].clone())
+            })
+        })
+        .collect();
+        let config = if preview { None } else { Config::load().ok() };
+        let store = config.as_ref().map(Store::load).unwrap_or_default();
+        let editor = cx.new(|cx| zorite_editor::EditorState::new(window, cx));
+        let summary_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue summary"));
+        let mut this = Self {
+            focus: cx.focus_handle(),
+            config,
+            client: None,
+            store,
+            inputs,
+            editor,
+            summary_input,
+            tab: 0,
+            selected: 0,
+            stack: Vec::new(),
+            status: "Ready to connect".into(),
+            loading: 0,
+            tx,
+            rx,
+            demo: false,
+            edit: None,
+            choices: Vec::new(),
+            picker: None,
+            picker_key: None,
+            palette: false,
+            sort: Default::default(),
+            list_scroll: UniformListScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
+            import_config: legacy.map(|(c, _)| c),
+            pending_config: None,
+            last_refresh: std::time::Instant::now(),
+            cache_writer: crate::store::writer(),
+            current_user: None,
+            refresh_errors: Vec::new(),
+            revision: 0,
+            pending_refresh: false,
+            connecting: false,
+            subscriptions: Vec::new(),
+            create_summary: String::new(),
+            saving: false,
+        };
+        if std::env::args().any(|a| a == "--demo") {
+            this.demo();
+        }
+        if std::env::args().any(|a| a == "--editor-check") {
+            this.demo();
+            this.edit = Some((
+                "NBJ-101".into(),
+                "description".into(),
+                crate::adf::Document::default(),
+            ));
+            this.editor.update(cx,|e,cx|e.set_text("GPUI Kit + zorite-editor compatibility check\n\nType here to test the native editor.",cx));
+        }
+        if this.config.is_some() && !this.demo {
+            this.connect_existing();
+        }
+        this.focus.focus(window, cx);
+        if this.import_config.is_some() && !this.demo {
+            this.status = "Found jira-tui settings. Connect to verify and import them.".into();
+        }
+        let watch_tx = this.tx.tx.clone();
+        std::thread::spawn(move || {
+            let mut modified = std::fs::metadata(crate::config::path())
+                .and_then(|m| m.modified())
+                .ok();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let next = std::fs::metadata(crate::config::path())
+                    .and_then(|m| m.modified())
+                    .ok();
+                if next != modified {
+                    modified = next;
+                    if watch_tx
+                        .send((
+                            u64::MAX,
+                            Message::ConfigChanged(Config::load().map_err(|e| e.to_string())),
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        this.subscriptions
+            .push(cx.observe(&this.inputs[4], |_, _, cx| cx.notify()));
+        this.subscriptions
+            .push(cx.observe(&this.inputs[5], |_, _, cx| cx.notify()));
+        this.subscriptions.push(cx.subscribe_in(
+            &this.inputs[5],
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.palette_execute(window, cx);
+                }
+            },
+        ));
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                if view.update(cx, |view, cx| view.poll(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        this
+    }
+    fn connect_existing(&mut self) {
+        self.connecting = true;
+        self.tx.epoch += 1;
+        let c = self.config.clone().unwrap();
+        let tx = self.tx.clone();
+        self.status = "Connecting to Jira…".into();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<_> {
+                let token = c.credential()?.get_password()?;
+                let client = Client::new(c, token);
+                let user = client.get("myself")?;
+                Ok((client, user))
+            })();
+            let _ = tx.send(Message::Connected(result.map_err(|e| e.to_string())));
+        });
+    }
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.connecting {
+            return;
+        }
+        let values: Vec<String> = self
+            .inputs
+            .iter()
+            .take(4)
+            .map(|s| s.read(cx).value().to_string().trim().to_string())
+            .collect();
+        let mut c = Config::initial(values[0].clone(), values[1].clone(), values[3].clone());
+        if let Some(import) = &self.import_config {
+            c.tabs = import.tabs.clone();
+        }
+        if let Err(e) = c.validate() {
+            self.status = e.to_string();
+            return;
+        }
+        if values[2].is_empty() {
+            self.status = "Enter an API token".into();
+            return;
+        }
+        let token = values[2].clone();
+        self.connecting = true;
+        self.tx.epoch += 1;
+        let tx = self.tx.clone();
+        self.status = "Checking your account…".into();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<_> {
+                let client = Client::new(c.clone(), token.clone());
+                let user = client.get("myself")?;
+                c.credential()?.set_password(&token)?;
+                c.save()?;
+                Ok((client, user))
+            })();
+            let _ = tx.send(Message::Connected(result.map_err(|e| e.to_string())));
+        });
+    }
+    fn refresh(&mut self) {
+        if self.loading > 0 || self.saving {
+            self.pending_refresh = true;
+            return;
+        }
+        self.pending_refresh = false;
+        if let Some(client) = self.client.clone() {
+            self.refresh_errors.clear();
+            self.last_refresh = std::time::Instant::now();
+            self.loading = client.config.tabs.len();
+            self.status = "Refreshing issues…".into();
+            for index in 0..self.loading {
+                let client = client.clone();
+                let tx = self.tx.clone();
+                let revision = self.revision;
+                std::thread::spawn(move || {
+                    let result = client.search(index).map_err(|e| e.to_string());
+                    let _ = tx.send(Message::Tab(index, revision, result));
+                });
+            }
+        }
+    }
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        while let Ok((epoch, message)) = self.rx.try_recv() {
+            if epoch != u64::MAX && epoch != self.tx.epoch {
+                continue;
+            }
+            changed = true;
+            match message {
+                Message::ConfigChanged(Ok(c)) => {
+                    if !self.demo {
+                        self.pending_config = Some(c);
+                    }
+                }
+                Message::ConfigChanged(Err(e)) => {
+                    self.status = format!("Config reload failed: {e}")
+                }
+                Message::Connected(Ok((client, user))) => {
+                    self.connecting = false;
+                    self.current_user = Some(user.clone());
+                    self.status = format!(
+                        "Connected as {}",
+                        user["displayName"].as_str().unwrap_or("you")
+                    );
+                    self.config = Some(client.config.clone());
+                    self.client = Some(client);
+                    self.refresh();
+                }
+                Message::Connected(Err(e)) => {
+                    self.connecting = false;
+                    self.status = format!("Connection failed: {e}");
+                }
+                Message::Tab(index, revision, result) => {
+                    self.loading = self.loading.saturating_sub(1);
+                    if revision != self.revision {
+                        self.pending_refresh = true;
+                        continue;
+                    }
+                    match result {
+                        Ok(issues) => {
+                            if self.saving {
+                                continue;
+                            }
+                            let selected_key = self.keys(cx).get(self.selected).cloned();
+                            self.store.set_tab(index, issues);
+                            if let Some(key) = selected_key
+                                && let Some(pos) = self.keys(cx).iter().position(|k| k == &key)
+                            {
+                                self.selected = pos;
+                            }
+                            if let Some(c) = &self.config {
+                                let store = self.store.clone();
+                                let c = c.clone();
+                                let _ = self.cache_writer.send((store, c));
+                            }
+                            if self.loading == 0 {
+                                self.status = if self.refresh_errors.is_empty() {
+                                    "Up to date".into()
+                                } else {
+                                    format!(
+                                        "Some tabs could not refresh: {}",
+                                        self.refresh_errors.join("; ")
+                                    )
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            self.refresh_errors.push(e.clone());
+                            self.status = format!("Refresh failed: {e}");
+                        }
+                    }
+                }
+                Message::Detail(revision, Ok(issue)) => {
+                    if revision != self.revision {
+                        continue;
+                    }
+                    if self.saving {
+                        continue;
+                    }
+                    self.store.issues.insert(issue.key.clone(), issue);
+                }
+                Message::Detail(revision, Err(e)) => {
+                    if revision == self.revision {
+                        self.status = format!("Could not load issue: {e}");
+                    }
+                }
+                Message::Saved(key, old, result) => {
+                    self.saving = false;
+                    match result {
+                        Ok(data) => {
+                            self.edit = None;
+                            self.status = "Saved".into();
+                            if data["deleted"] == true {
+                                self.store.issues.remove(&key);
+                                self.stack.retain(|k| k != &key);
+                                for tab in &mut self.store.tabs {
+                                    tab.retain(|k| k != &key);
+                                }
+                                self.refresh();
+                                continue;
+                            }
+                            let key = data["key"].as_str().unwrap_or(&key).to_string();
+                            self.refresh();
+                            if let Some(client) = self.client.clone() {
+                                let tx = self.tx.clone();
+                                let revision = self.revision;
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(Message::Detail(
+                                        revision,
+                                        client.issue(&key).map_err(|e| e.to_string()),
+                                    ));
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            if key.is_empty() {
+                                self.edit = Some((
+                                    "New issue".into(),
+                                    "create".into(),
+                                    crate::adf::Document::default(),
+                                ));
+                            }
+                            if let Some(old) = old {
+                                self.store.issues.insert(key, old);
+                            }
+                            self.status = format!("Save failed; changes rolled back: {e}");
+                        }
+                    }
+                }
+                Message::Choices(kind, key, result) => match result {
+                    Ok(choices) => {
+                        let quick_done = kind == "done" && choices.len() == 1;
+                        self.choices = choices;
+                        self.picker = Some(kind);
+                        self.picker_key = Some(key);
+                        if quick_done {
+                            let (id, label) = self.choices[0].clone();
+                            self.apply_choice(id, label, cx);
+                        }
+                    }
+                    Err(e) => self.status = format!("Could not load choices: {e}"),
+                },
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        if self.pending_refresh && self.loading == 0 && !self.saving {
+            self.refresh();
+            cx.notify();
+        }
+        if !self.demo
+            && self.client.is_some()
+            && self.last_refresh.elapsed().as_secs()
+                >= self
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.ttl_seconds().ok())
+                    .unwrap_or(300)
+        {
+            self.refresh();
+            cx.notify();
+        }
+        if self.loading == 0
+            && !self.saving
+            && self.edit.is_none()
+            && self.picker.is_none()
+            && !self.connecting
+            && let Some(c) = self.pending_config.take()
+        {
+            self.store = Store::load(&c);
+            self.client = None;
+            self.config = Some(c);
+            self.tab = 0;
+            self.selected = 0;
+            self.stack.clear();
+            self.connect_existing();
+            cx.notify();
+        }
+    }
+    fn keys(&self, cx: &App) -> Vec<String> {
+        let query = self.inputs[4].read(cx).value().to_string().to_lowercase();
+        let mut keys: Vec<String> = self
+            .store
+            .tabs
+            .get(self.tab)
+            .into_iter()
+            .flatten()
+            .filter(|key| {
+                self.store.issues.get(*key).is_some_and(|i| {
+                    format!("{} {}", i.key, i.field("summary"))
+                        .to_lowercase()
+                        .contains(&query)
+                })
+            })
+            .cloned()
+            .collect();
+        let default = self
+            .config
+            .as_ref()
+            .and_then(|c| c.tabs.get(self.tab))
+            .map(|t| (t.sort.clone(), 0))
+            .unwrap_or_default();
+        let (field, mode) = self.sort.get(&self.tab).unwrap_or(&default);
+        if !field.is_empty() && *mode < 2 {
+            keys.sort_by_key(|k| {
+                self.store
+                    .issues
+                    .get(k)
+                    .map(|i| {
+                        if field == "key" {
+                            i.key.clone()
+                        } else {
+                            i.field(field)
+                        }
+                    })
+                    .unwrap_or_default()
+            });
+            if *mode == 1 {
+                keys.reverse();
+            }
+        }
+        keys
+    }
+    fn open(&mut self, key: String) {
+        self.stack.push(key.clone());
+        if let Some(client) = self.client.clone() {
+            let tx = self.tx.clone();
+            let revision = self.revision;
+            std::thread::spawn(move || {
+                let _ = tx.send(Message::Detail(
+                    revision,
+                    client.issue(&key).map_err(|e| e.to_string()),
+                ));
+            });
+        }
+    }
+    fn current(&self, cx: &App) -> Option<String> {
+        self.stack
+            .last()
+            .cloned()
+            .or_else(|| self.keys(cx).get(self.selected).cloned())
+    }
+    fn begin_edit(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.current(cx) else {
+            return;
+        };
+        let Some(issue) = self.store.issues.get(&key) else {
+            return;
+        };
+        if kind == "description" && issue.fields.get("description").is_none() {
+            self.status = "Open the issue and wait for its full description before editing.".into();
+            return;
+        }
+        let doc = if kind == "description" {
+            crate::adf::Document::from_adf(&issue.fields[kind])
+        } else {
+            crate::adf::Document::default()
+        };
+        let text = if kind == "summary" {
+            issue.field(kind)
+        } else if kind == "comment" {
+            String::new()
+        } else {
+            doc.markdown.clone()
+        };
+        self.editor.update(cx, |e, cx| {
+            e.set_text(text, cx);
+            e.focus(window, cx);
+        });
+        if kind == "summary" {
+            let value = issue.field("summary");
+            self.summary_input.update(cx, |s, cx| {
+                s.set_value(value, window, cx);
+                s.focus(window, cx);
+            });
+        }
+        self.edit = Some((key, kind.into(), doc));
+    }
+    fn mutate(
+        &mut self,
+        key: String,
+        method: &str,
+        path: String,
+        body: Value,
+        optimistic: Option<Value>,
+    ) {
+        if self.saving {
+            self.status = "Wait for the current change to finish.".into();
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.status = "Connect to Jira to save changes. Demo data is read-only.".into();
+            return;
+        };
+        let old = self.store.issues.get(&key).cloned();
+        if let Some(fields) = optimistic
+            && let Some(issue) = self.store.issues.get_mut(&key)
+        {
+            for (k, v) in fields.as_object().unwrap() {
+                issue.fields[k] = v.clone();
+            }
+        }
+        let tx = self.tx.clone();
+        let method = method.to_string();
+        self.status = "Saving…".into();
+        self.saving = true;
+        self.revision += 1;
+        std::thread::spawn(move || {
+            let result = client
+                .send(&method, &path, body)
+                .map(|v| {
+                    if method == "DELETE" {
+                        json!({"deleted":true})
+                    } else {
+                        v
+                    }
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Message::Saved(key, old, result));
+        });
+    }
+    fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((key, kind, doc)) = &self.edit else {
+            return;
+        };
+        let text = if kind == "summary" || kind == "create" {
+            self.summary_input.read(cx).value().to_string()
+        } else {
+            self.editor.read(cx).text().to_string()
+        };
+        let key = key.clone();
+        let kind = kind.clone();
+        if self.saving {
+            return;
+        }
+        if kind == "create" {
+            if text.trim().is_empty() {
+                self.status = "Enter an issue summary".into();
+                return;
+            }
+            let Some(client) = self.client.clone() else {
+                self.status = "Connect an account to create issues".into();
+                return;
+            };
+            let project = client.config.jira.default_project.clone();
+            if project.is_empty() {
+                self.status = "Set jira.default_project in your config first".into();
+                return;
+            }
+            self.create_summary = text.trim().to_string();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<_> {
+                    let data = client.get(&format!("issue/createmeta/{project}/issuetypes"))?;
+                    Ok(data["issueTypes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| {
+                            Some((v["id"].as_str()?.into(), v["name"].as_str()?.into()))
+                        })
+                        .collect())
+                })();
+                let _ = tx.send(Message::Choices(
+                    "create".into(),
+                    String::new(),
+                    result.map_err(|e| e.to_string()),
+                ));
+            });
+            self.edit = None;
+            self.focus.focus(window, cx);
+            return;
+        }
+        if text.trim().is_empty() && kind != "description" {
+            self.status = "Text cannot be empty".into();
+            return;
+        }
+        let value = if kind == "summary" {
+            json!(text)
+        } else {
+            match doc.to_adf(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.status = e.to_string();
+                    return;
+                }
+            }
+        };
+        let (path, body, optimistic) = if kind == "comment" {
+            (format!("issue/{key}/comment"), json!({"body":value}), None)
+        } else {
+            (
+                format!("issue/{key}"),
+                json!({"fields":{kind.clone():value.clone()}}),
+                Some(json!({kind.clone():value})),
+            )
+        };
+        if self.client.is_none() {
+            self.status = "Demo data is read-only. Connect your account to save.".into();
+            return;
+        }
+        self.mutate(
+            key,
+            if kind == "comment" { "POST" } else { "PUT" },
+            path,
+            body,
+            optimistic,
+        );
+        self.focus.focus(window, cx);
+    }
+    fn choose(&mut self, kind: &str, cx: &mut Context<Self>) {
+        let Some(key) = self.current(cx) else {
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            self.status = "Connect your account to edit issues.".into();
+            return;
+        };
+        let tx = self.tx.clone();
+        let kind = kind.to_string();
+        self.status = "Loading choices…".into();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<Vec<(String, String)>> {
+                let data = if kind == "status" || kind == "done" {
+                    client.get(&format!("issue/{key}/transitions"))?["transitions"].clone()
+                } else if kind == "priority" {
+                    client.get("priority")?
+                } else {
+                    client.get(&format!(
+                        "user/assignable/search?issueKey={key}&maxResults=100"
+                    ))?
+                };
+                Ok(data
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|v| kind != "done" || v["to"]["statusCategory"]["key"] == "done")
+                    .filter_map(|v| {
+                        Some((
+                            v[if kind == "assignee" {
+                                "accountId"
+                            } else {
+                                "id"
+                            }]
+                            .as_str()?
+                            .into(),
+                            v[if kind == "assignee" {
+                                "displayName"
+                            } else {
+                                "name"
+                            }]
+                            .as_str()?
+                            .into(),
+                        ))
+                    })
+                    .collect())
+            })();
+            let _ = tx.send(Message::Choices(
+                kind,
+                key,
+                result.map_err(|e| e.to_string()),
+            ));
+        });
+    }
+    fn apply_choice(&mut self, id: String, label: String, cx: &mut Context<Self>) {
+        let key = self
+            .picker_key
+            .take()
+            .or_else(|| self.current(cx))
+            .unwrap_or_default();
+        let Some(kind) = self.picker.take() else {
+            return;
+        };
+        if kind == "create" {
+            let project = self.config.as_ref().unwrap().jira.default_project.clone();
+            self.mutate(String::new(),"POST","issue".into(),json!({"fields":{"project":{"key":project},"issuetype":{"id":id},"summary":self.create_summary}}),None);
+        } else if kind == "delete" {
+            self.mutate(
+                key.clone(),
+                "DELETE",
+                format!("issue/{key}"),
+                Value::Null,
+                None,
+            );
+        } else if kind == "status" || kind == "done" {
+            self.mutate(
+                key.clone(),
+                "POST",
+                format!("issue/{key}/transitions"),
+                json!({"transition":{"id":id}}),
+                Some(json!({"status":{"name":label}})),
+            );
+        } else {
+            let field = if kind == "assignee" {
+                json!({"accountId":id})
+            } else {
+                json!({"id":id})
+            };
+            let preview = if kind == "assignee" {
+                json!({"displayName":label})
+            } else {
+                json!({"name":label})
+            };
+            self.mutate(
+                key.clone(),
+                "PUT",
+                format!("issue/{key}"),
+                json!({"fields":{kind.clone():field}}),
+                Some(json!({kind:preview})),
+            );
+        }
+    }
+    fn demo(&mut self) {
+        self.tx.epoch += 1;
+        self.connecting = false;
+        self.client = None;
+        self.current_user = None;
+        self.loading = 0;
+        self.pending_config = None;
+        self.pending_refresh = false;
+        self.store = Store::default();
+        self.stack.clear();
+        self.tab = 0;
+        self.selected = 0;
+        self.demo = true;
+        self.config = Some(Config::initial(
+            "https://example.atlassian.net".into(),
+            "demo@example.com".into(),
+            "NBJ".into(),
+        ));
+        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text when editing Markdown","To Do","High","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":{"content":[{"type":"paragraph","content":[{"type":"text","text":"A fast, focused workspace for your Jira issues."}]}]}})}).collect();
+        self.store.set_tab(0, issues);
+        self.status = "Demo workspace · sample data".into();
+    }
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit.is_some()
+            && event.keystroke.modifiers.control
+            && event.keystroke.key == "enter"
+        {
+            self.save_edit(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if event.keystroke.modifiers.control && event.keystroke.key == "k" {
+            if self.edit.is_some() {
+                return;
+            }
+            self.palette = !self.palette;
+            if self.palette {
+                self.inputs[5].update(cx, |s, cx| {
+                    s.set_value("", window, cx);
+                    s.focus(window, cx);
+                });
+            } else {
+                self.focus.focus(window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        if event.keystroke.key == "escape" {
+            if self.palette {
+                self.palette = false;
+                self.focus.focus(window, cx);
+                cx.notify();
+                return;
+            }
+            if self.edit.take().is_some() || self.picker.take().is_some() {
+                self.focus.focus(window, cx);
+                cx.notify();
+                return;
+            }
+            self.focus.focus(window, cx);
+        }
+        if self.edit.is_some() {
+            return;
+        }
+        if !self.focus.is_focused(window) {}
+    }
+    fn command(
+        &mut self,
+        action: &crate::actions::Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.edit.is_some() || !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        self.run_command(&action.key, window, cx);
+    }
+    fn run_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = false;
+        self.focus.focus(window, cx);
+        if self.saving && ["s", "p", "a", "t", "e", "m", "c", "delete", "d", "i"].contains(&command)
+        {
+            self.status = "Wait for the current change to finish.".into();
+            cx.notify();
+            return;
+        }
+        if let Some(n) = command
+            .strip_prefix("sort-")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if let Some(field) = self
+                .config
+                .as_ref()
+                .and_then(|c| c.tabs.get(self.tab))
+                .and_then(|t| t.columns.get(n.saturating_sub(1)))
+                .cloned()
+            {
+                self.cycle_sort(field);
+            }
+            cx.notify();
+            return;
+        }
+        if !self.stack.is_empty() {
+            match command {
+                "j" | "down" => {
+                    let p = self.detail_scroll.offset();
+                    self.detail_scroll.set_offset(point(p.x, p.y - px(40.)));
+                    cx.notify();
+                    return;
+                }
+                "k" | "up" => {
+                    let p = self.detail_scroll.offset();
+                    self.detail_scroll.set_offset(point(p.x, p.y + px(40.)));
+                    cx.notify();
+                    return;
+                }
+                "home" => {
+                    self.detail_scroll.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                    return;
+                }
+                "enter" => return,
+                _ => {}
+            }
+        }
+        let keys = self.keys(cx);
+        let n = keys.len();
+        match command {
+            "j" | "down" => self.selected = (self.selected + 1).min(n.saturating_sub(1)),
+            "k" | "up" => self.selected = self.selected.saturating_sub(1),
+            "home" => self.selected = 0,
+            "end" => self.selected = n.saturating_sub(1),
+            "enter" => {
+                if let Some(key) = keys.get(self.selected) {
+                    self.open(key.clone());
+                }
+            }
+            "escape" => {
+                if self.stack.pop().is_none() {
+                    self.inputs[4].update(cx, |s, cx| s.set_value("", window, cx));
+                }
+            }
+            "r" => self.refresh(),
+            "q" => cx.quit(),
+            "h" | "left" => {
+                self.tab = self.tab.saturating_sub(1);
+                self.selected = 0;
+            }
+            "l" | "right" => {
+                self.tab = (self.tab + 1).min(
+                    self.config
+                        .as_ref()
+                        .map(|c| c.tabs.len().saturating_sub(1))
+                        .unwrap_or(0),
+                );
+                self.selected = 0;
+            }
+            "/" => {
+                self.inputs[4].update(cx, |s, cx| s.focus(window, cx));
+            }
+            "t" => self.begin_edit("summary", window, cx),
+            "e" => self.begin_edit("description", window, cx),
+            "m" => self.begin_edit("comment", window, cx),
+            "s" => self.choose("status", cx),
+            "p" => self.choose("priority", cx),
+            "a" => self.choose("assignee", cx),
+            "ctrl-," => {
+                cx.open_url(&format!(
+                    "file:///{}",
+                    crate::config::path().to_string_lossy().replace('\\', "/")
+                ));
+            }
+            "ctrl-shift-c" => {
+                if self.saving {
+                    return;
+                }
+                if let Some(c) = &self.config {
+                    for (i, value) in [
+                        c.jira.base_url.clone(),
+                        c.jira.email.clone(),
+                        String::new(),
+                        c.jira.default_project.clone(),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        self.inputs[i].update(cx, |s, cx| s.set_value(value, window, cx));
+                    }
+                }
+                self.tx.epoch += 1;
+                self.loading = 0;
+                self.connecting = false;
+                self.pending_refresh = false;
+                self.pending_config = None;
+                self.current_user = None;
+                self.client = None;
+                self.config = None;
+                self.demo = false;
+                self.store = Store::default();
+                self.stack.clear();
+                self.status = "Connect your Jira Cloud account".into();
+            }
+            "delete" => {
+                if let Some(key) = self.current(cx) {
+                    self.picker = Some("delete".into());
+                    self.picker_key = Some(key.clone());
+                    self.choices = vec![(key, "Delete permanently".into())];
+                }
+            }
+            "i" => {
+                if let (Some(key), Some(user)) = (self.current(cx), self.current_user.clone()) {
+                    self.mutate(key.clone(),"PUT",format!("issue/{key}/assignee"),json!({"accountId":user["accountId"]}),Some(json!({"assignee":{"accountId":user["accountId"],"displayName":user["displayName"]}})));
+                } else {
+                    self.status = "Connect your account to assign issues".into();
+                }
+            }
+            "d" => {
+                self.choose("done", cx);
+                self.status = "Choose the workflow's Done transition".into();
+            }
+            "c" => {
+                self.edit = Some((
+                    "New issue".into(),
+                    "create".into(),
+                    crate::adf::Document::default(),
+                ));
+                self.summary_input.update(cx, |s, cx| {
+                    s.set_value("", window, cx);
+                    s.focus(window, cx);
+                });
+            }
+            "y" | "u" | "o" => {
+                let key = self
+                    .stack
+                    .last()
+                    .cloned()
+                    .or_else(|| keys.get(self.selected).cloned());
+                if let Some(key) = key {
+                    let url = format!(
+                        "{}/browse/{}",
+                        self.config.as_ref().unwrap().jira.base_url,
+                        key
+                    );
+                    match command {
+                        "y" => cx.write_to_clipboard(ClipboardItem::new_string(key)),
+                        "u" => cx.write_to_clipboard(ClipboardItem::new_string(url)),
+                        _ => cx.open_url(&url),
+                    }
+                }
+            }
+            d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
+                let t = d.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                if t < self.config.as_ref().map(|c| c.tabs.len()).unwrap_or(0) {
+                    self.tab = t;
+                    self.selected = 0;
+                }
+            }
+            _ => {}
+        }
+        if n > 0 {
+            self.list_scroll
+                .scroll_to_item(self.selected.min(n - 1), ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+    fn cycle_sort(&mut self, field: String) {
+        let mode = self
+            .sort
+            .get(&self.tab)
+            .filter(|(f, _)| f == &field)
+            .map(|(_, m)| (m + 1) % 3)
+            .unwrap_or(0);
+        self.sort.insert(self.tab, (field, mode));
+        self.selected = 0;
+    }
+    fn palette_execute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.inputs[5].read(cx).value().to_string();
+        let query = query.trim();
+        let candidate = query.to_uppercase();
+        let valid_key = candidate.rsplit_once('-').is_some_and(|(p, n)| {
+            !p.is_empty()
+                && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !n.is_empty()
+                && n.chars().all(|c| c.is_ascii_digit())
+        });
+        if valid_key {
+            self.palette = false;
+            self.open(candidate);
+            self.focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        if let Some((key, _)) = crate::actions::COMMANDS
+            .iter()
+            .find(|(_, label)| fuzzy(query, label))
+        {
+            let key = key.to_string();
+            self.run_command(&key, window, cx);
+            return;
+        }
+        if let Some(issue) = self
+            .store
+            .issues
+            .values()
+            .find(|i| fuzzy(query, &format!("{} {}", i.key, i.field("summary"))))
+        {
+            let key = issue.key.clone();
+            self.palette = false;
+            self.open(key);
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+}
+fn fuzzy(query: &str, text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let mut chars = lower.chars();
+    query
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .all(|q| chars.by_ref().any(|c| c == q))
+}
+fn cell(text: String, field: &str) -> Div {
+    if field == "summary" {
+        div()
+            .flex_1()
+            .min_w_0()
+            .pr_4()
+            .overflow_hidden()
+            .child(text)
+    } else {
+        column(
+            text,
+            match field {
+                "key" => 120.,
+                "status" => 130.,
+                "priority" => 80.,
+                "assignee" | "reporter" => 160.,
+                _ => 130.,
+            },
+        )
+        .pr_3()
+    }
+}
+fn muted(text: impl Into<SharedString>) -> Div {
+    div()
+        .text_color(rgb(0x929cad))
+        .text_size(px(12.))
+        .child(text.into())
+}
+fn column(text: String, width: f32) -> Div {
+    div()
+        .w(px(width))
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(text)
+}
+fn adf_text(v: &Value) -> String {
+    if v["type"] == "text" {
+        return v["text"].as_str().unwrap_or("").into();
+    }
+    let mut s = v["content"]
+        .as_array()
+        .map(|a| a.iter().map(adf_text).collect::<String>())
+        .unwrap_or_default();
+    if matches!(
+        v["type"].as_str(),
+        Some("paragraph" | "heading" | "listItem")
+    ) {
+        s.push('\n');
+    }
+    s
+}
+impl Render for AppView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut body = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
+        if let Some(c) = &self.config {
+            let tabs = div()
+                .flex()
+                .items_center()
+                .h(px(40.))
+                .flex_shrink_0()
+                .px_6()
+                .gap_6()
+                .border_b_1()
+                .border_color(rgb(0x2b303b))
+                .children(c.tabs.iter().enumerate().map(|(i, t)| {
+                    div()
+                        .id(("tab", i))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .border_b_2()
+                        .border_color(rgb(if i == self.tab { 0x79aaf9 } else { 0x191c23 }))
+                        .text_color(rgb(if i == self.tab { 0xf0f3f9 } else { 0x929cad }))
+                        .cursor_pointer()
+                        .child(t.label.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tab = i;
+                            this.selected = 0;
+                            this.stack.clear();
+                            cx.notify();
+                        }))
+                }))
+                .child(div().flex_1())
+                .child(
+                    Button::new("commands")
+                        .small()
+                        .label("Commands  Ctrl+K")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.palette = true;
+                            this.inputs[5].update(cx, |s, cx| {
+                                s.set_value("", window, cx);
+                                s.focus(window, cx);
+                            });
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("refresh")
+                        .small()
+                        .label(if self.loading > 0 {
+                            "Refreshing…"
+                        } else {
+                            "Refresh  R"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh();
+                            cx.notify();
+                        })),
+                );
+            body = body.child(tabs);
+            if let Some(key) = self.stack.last() {
+                let issue = self.store.issues.get(key).cloned().unwrap_or_default();
+                body = body.child(
+                    div()
+                        .id("detail")
+                        .track_scroll(&self.detail_scroll)
+                        .overflow_y_scroll()
+                        .p_6()
+                        .flex()
+                        .flex_col()
+                        .gap_5()
+                        .child(
+                            Button::new("back")
+                                .small()
+                                .w(px(180.))
+                                .label("← Back to issues   Esc")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.stack.pop();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(muted(issue.key.clone()))
+                        .child(
+                            div()
+                                .text_size(px(26.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(issue.field("summary")),
+                        )
+                        .child(div().flex().gap_6().children(
+                            ["status", "priority", "assignee"].map(|f| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(muted(f))
+                                    .child(issue.field(f))
+                            }),
+                        ))
+                        .child(div().h(px(1.)).bg(rgb(0x303744)))
+                        .child(div().text_size(px(15.)).child(
+                            gpui_kit::component::text::TextView::markdown(
+                                "description",
+                                crate::adf::Document::display(&issue.fields["description"]),
+                            ),
+                        ))
+                        .child(muted("COMMENTS"))
+                        .children(
+                            issue.fields["subtasks"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .chain(
+                                    std::iter::once(&issue.fields["parent"])
+                                        .filter(|v| !v.is_null()),
+                                )
+                                .chain(
+                                    issue.fields["issuelinks"]
+                                        .as_array()
+                                        .into_iter()
+                                        .flatten()
+                                        .map(|v| {
+                                            if v["outwardIssue"].is_object() {
+                                                &v["outwardIssue"]
+                                            } else {
+                                                &v["inwardIssue"]
+                                            }
+                                        }),
+                                )
+                                .enumerate()
+                                .filter_map(|(i, v)| {
+                                    let key = v["key"].as_str()?.to_string();
+                                    Some(
+                                        Button::new(("related", i))
+                                            .label(format!(
+                                                "{}  {}",
+                                                key,
+                                                v["fields"]["summary"]
+                                                    .as_str()
+                                                    .unwrap_or("Related issue")
+                                            ))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open(key.clone());
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        )
+                        .children(
+                            issue.fields["comment"]["comments"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|v| {
+                                    div()
+                                        .py_3()
+                                        .border_b_1()
+                                        .border_color(rgb(0x303744))
+                                        .child(muted(
+                                            v["author"]["displayName"]
+                                                .as_str()
+                                                .unwrap_or("Unknown")
+                                                .to_string(),
+                                        ))
+                                        .child(adf_text(&v["body"]))
+                                }),
+                        ),
+                );
+            } else {
+                let keys = self.keys(cx);
+                let count = keys.len();
+                let columns = c.tabs[self.tab].columns.clone();
+                body = body
+                    .child(
+                        div()
+                            .px_6()
+                            .py_3()
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .child(div().w(px(360.)).child(Input::new(&self.inputs[4]).small()))
+                            .child(muted(format!("{count} issues"))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .px_6()
+                            .py_2()
+                            .text_color(rgb(0x929cad))
+                            .text_size(px(11.))
+                            .border_l_2()
+                            .border_color(rgb(0x191c23))
+                            .children(columns.iter().enumerate().map(|(i, field)| {
+                                let field = field.clone();
+                                cell(field.to_uppercase(), &field)
+                                    .id(("column", i))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.cycle_sort(field.clone());
+                                        cx.notify();
+                                    }))
+                            })),
+                    );
+                if keys.is_empty() {
+                    body = body.child(div().flex_1().flex().items_center().justify_center().child(
+                        muted(if self.loading > 0 {
+                            "Loading your issues…"
+                        } else {
+                            "No issues here. Try refreshing or changing your filter."
+                        }),
+                    ));
+                } else {
+                    body = body.child(
+                        uniform_list(
+                            "issues",
+                            count,
+                            cx.processor(
+                                move |this: &mut Self,
+                                      range: std::ops::Range<usize>,
+                                      _: &mut Window,
+                                      cx: &mut Context<Self>| {
+                                    range
+                                        .map(|i| {
+                                            let issue = this.store.issues.get(&keys[i]).unwrap();
+                                            let selected = i == this.selected;
+                                            let status = issue.field("status");
+                                            let key = issue.key.clone();
+                                            let weak = cx.entity().downgrade();
+                                            div()
+                                                .id(("issue", i))
+                                                .w_full()
+                                                .h(px(32.))
+                                                .flex()
+                                                .items_center()
+                                                .px_6()
+                                                .border_l_2()
+                                                .border_color(rgb(if selected {
+                                                    0x79aaf9
+                                                } else {
+                                                    0x191c23
+                                                }))
+                                                .bg(rgb(if selected { 0x253348 } else { 0x191c23 }))
+                                                .cursor_pointer()
+                                                .children(columns.iter().map(|field| {
+                                                    let value = if field == "key" {
+                                                        issue.key.clone()
+                                                    } else {
+                                                        issue.field(if field == "type" {
+                                                            "issuetype"
+                                                        } else {
+                                                            field
+                                                        })
+                                                    };
+                                                    let color = match field.as_str() {
+                                                        "key" => 0x91b9f7,
+                                                        "status" if status == "Done" => 0x83d4ac,
+                                                        "status" if status == "In Progress" => {
+                                                            0x91b9f7
+                                                        }
+                                                        "summary" => 0xe6ebf3,
+                                                        "priority"
+                                                            if value == "High"
+                                                                || value == "Highest" =>
+                                                        {
+                                                            0xe4b77b
+                                                        }
+                                                        _ => 0xa4afc0,
+                                                    };
+                                                    cell(value, field)
+                                                        .font_family(if field == "key" {
+                                                            "JetBrains Mono"
+                                                        } else {
+                                                            "Inter"
+                                                        })
+                                                        .text_color(rgb(color))
+                                                }))
+                                                .on_click(cx.listener(
+                                                    move |this, event: &ClickEvent, _, cx| {
+                                                        this.selected = i;
+                                                        if event.click_count() == 2 {
+                                                            this.open(key.clone());
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                                .context_menu(move |mut menu, _, _| {
+                                                    for (command, label) in crate::actions::COMMANDS
+                                                    {
+                                                        let command = command.to_string();
+                                                        let weak = weak.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(format!(
+                                                                "{label}    {command}"
+                                                            ))
+                                                            .on_click(move |_, window, cx| {
+                                                                let _ =
+                                                                    weak.update(cx, |this, cx| {
+                                                                        this.selected = i;
+                                                                        this.run_command(
+                                                                            &command, window, cx,
+                                                                        );
+                                                                        cx.notify();
+                                                                    });
+                                                            }),
+                                                        );
+                                                    }
+                                                    menu
+                                                })
+                                        })
+                                        .collect()
+                                },
+                            ),
+                        )
+                        .track_scroll(&self.list_scroll)
+                        .w_full()
+                        .flex_1()
+                        .min_h_0(),
+                    );
+                }
+            }
+        } else {
+            let form=div().w(px(440.)).flex().flex_col().gap_4()
+                .child(muted("YOUR WORK, WITHOUT THE NOISE"))
+                .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).child("Connect to Jira"))
+                .child(div().text_color(rgb(0xa5afbf)).child("A fast, focused home for your issues. Connect your Jira Cloud account to get started."))
+                .children(["Jira site","Email address","API token","Default project"].iter().enumerate().map(|(i,label)| div().flex().flex_col().gap_2().child(muted(*label)).child(Input::new(&self.inputs[i]))))
+                .child(muted("Your API token is stored in Windows Credential Manager."))
+                .child(Button::new("connect").primary().bg(rgb(0x3776c8)).text_color(rgb(0xffffff)).label("Connect account").on_click(cx.listener(|this,_,_,cx|{this.connect(cx);cx.notify();})))
+                .child(Button::new("demo").label("Explore a demo workspace").on_click(cx.listener(|this,_,_,cx|{this.demo();cx.notify();})));
+            body = body.items_center().justify_center().child(form);
+        }
+        if self.palette {
+            let query = self.inputs[5].read(cx).value().to_string();
+            let first = crate::actions::COMMANDS
+                .iter()
+                .position(|(_, label)| fuzzy(&query, label));
+            let results = div()
+                .id("palette")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(muted("COMMANDS"))
+                .children(
+                    crate::actions::COMMANDS
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, label))| fuzzy(&query, label))
+                        .map(|(i, (key, label))| {
+                            let key = key.to_string();
+                            command_row(
+                                ("command", i),
+                                label.to_string(),
+                                key_name(&key),
+                                first == Some(i),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.run_command(&key, window, cx);
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                )
+                .child(muted("ISSUES"))
+                .children(
+                    self.store
+                        .issues
+                        .values()
+                        .filter(|i| fuzzy(&query, &format!("{} {}", i.key, i.field("summary"))))
+                        .take(30)
+                        .enumerate()
+                        .map(|(i, issue)| {
+                            let key = issue.key.clone();
+                            command_row(
+                                ("jump", i),
+                                issue.field("summary"),
+                                key.clone(),
+                                first.is_none() && i == 0,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.palette = false;
+                                    this.open(key.clone());
+                                    this.focus.focus(window, cx);
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                );
+            body = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .max_w(px(840.))
+                .mx_auto()
+                .my_4()
+                .p_4()
+                .gap_3()
+                .bg(rgb(0x20252e))
+                .border_1()
+                .border_color(rgb(0x394352))
+                .rounded_lg()
+                .child(div().text_size(px(22.)).child("Commands"))
+                .child(Input::new(&self.inputs[5]).small())
+                .child(results);
+        } else if let Some((key, kind, _)) = &self.edit {
+            let single = kind == "summary" || kind == "create";
+            let editor_area = if single {
+                div()
+                    .child(Input::new(&self.summary_input))
+                    .into_any_element()
+            } else {
+                div()
+                    .id("markdown-editor")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_4()
+                    .bg(rgb(0x14171d))
+                    .font_family("JetBrains Mono")
+                    .text_size(px(14.))
+                    .border_1()
+                    .border_color(rgb(
+                        if self.editor.read(cx).focus_handle(cx).is_focused(window) {
+                            0x79aaf9
+                        } else {
+                            0x394352
+                        },
+                    ))
+                    .rounded_md()
+                    .child(self.editor.clone())
+                    .into_any_element()
+            };
+
+            body = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .p_6()
+                .gap_4()
+                .child(muted(format!("{} / Edit {}", key, kind)))
+                .child(editor_area)
+                .child(muted(if single {
+                    "A short summary for this issue."
+                } else {
+                    "Markdown ? Keep [ADF:n] protected content tokens intact."
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            Button::new("save-edit")
+                                .primary()
+                                .small()
+                                .bg(rgb(0x3776c8))
+                                .text_color(rgb(0xffffff))
+                                .label(if self.saving {
+                                    "Saving…"
+                                } else {
+                                    "Save changes   Ctrl+Enter"
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_edit(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("cancel-edit")
+                                .small()
+                                .label("Cancel   Esc")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edit = None;
+                                    this.focus.focus(window, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                );
+        } else if let Some(kind) = &self.picker {
+            body =
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .p_6()
+                    .gap_3()
+                    .child(div().text_size(px(22.)).child(format!("Choose {kind}")))
+                    .child(Button::new("cancel-picker").label("Cancel   Esc").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.picker = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(div().id("choices").overflow_y_scroll().children(
+                        self.choices.iter().enumerate().map(|(i, (id, label))| {
+                            let id = id.clone();
+                            let label = label.clone();
+                            Button::new(("choice", i))
+                                .label(label.clone())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.apply_choice(id.clone(), label.clone(), cx);
+                                    cx.notify();
+                                }))
+                        }),
+                    ));
+        }
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .font_family("Inter")
+            .text_size(px(13.))
+            .bg(rgb(0x191c23))
+            .text_color(rgb(0xe6ebf3))
+            .track_focus(&self.focus)
+            .key_context("Workspace")
+            .on_action(cx.listener(Self::command))
+            .on_key_down(cx.listener(Self::key))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus.focus(window, cx);
+                }),
+            )
+            .child(
+                TitleBar::new().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_color(rgb(0x91b9f7))
+                                .font_weight(FontWeight::BOLD)
+                                .child("◈"),
+                        )
+                        .child("not-bad-jira")
+                        .child(muted(if self.demo {
+                            " / Demo workspace"
+                        } else {
+                            " / Jira Cloud"
+                        })),
+                ),
+            )
+            .child(body)
+            .child(
+                div()
+                    .h(px(36.))
+                    .px_6()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(rgb(0x303744))
+                    .child(muted(self.status.clone()))
+                    .child(muted(if self.palette {
+                        "Enter  Run or open     Esc  Close"
+                    } else if self.config.is_none() {
+                        "Tab  Move between fields"
+                    } else if self.edit.is_some() {
+                        "Ctrl+Enter  Save     Esc  Cancel"
+                    } else {
+                        "J K  Move     Enter  Open     /  Filter     Ctrl+K  Commands"
+                    })),
+            )
+    }
+}
+
+fn key_name(key: &str) -> String {
+    match key {
+        "enter" => "Enter".into(),
+        "escape" => "Esc".into(),
+        "delete" => "Delete".into(),
+        "ctrl-," => "Ctrl+,".into(),
+        "ctrl-shift-c" => "Ctrl+Shift+C".into(),
+        _ => key.to_uppercase(),
+    }
+}
+fn command_row(id: impl Into<ElementId>, label: String, hint: String, selected: bool) -> Button {
+    Button::new(id)
+        .ghost()
+        .small()
+        .h(px(32.))
+        .rounded_none()
+        .bg(rgb(if selected { 0x253348 } else { 0x20252e }))
+        .border_l_2()
+        .border_color(rgb(if selected { 0x79aaf9 } else { 0x20252e }))
+        .accessibility_label(format!("{label} {hint}"))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .child(label)
+                .child(
+                    div()
+                        .font_family("JetBrains Mono")
+                        .text_size(px(11.))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x191c23))
+                        .text_color(rgb(0xa4afc0))
+                        .child(hint),
+                ),
+        )
+}

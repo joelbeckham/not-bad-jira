@@ -1,0 +1,1 @@
+Rust main to second frame callback (upper bound on first frame): 423.88 ms

@@ -1,0 +1,27 @@
+[package]
+name = "not-bad-jira"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "=0.9.1"
+zorite-editor = "=0.11.3"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+ureq = { version = "3", features = ["json"] }
+base64 = "0.22"
+keyring = { version = "3", features = ["windows-native"] }
+pulldown-cmark = "0.13"
+url = "2.5"
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
