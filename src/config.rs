@@ -44,54 +44,6 @@ pub fn cache_path() -> PathBuf {
     PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default())
         .join("not-bad-jira/cache/issues.json")
 }
-pub fn legacy() -> Option<(Config, String)> {
-    let mut roots = vec![
-        std::env::current_dir().ok()?.join(".jira-tui"),
-        PathBuf::from(std::env::var_os("USERPROFILE")?).join(".jira-tui"),
-    ];
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        roots.push(parent.join(".jira-tui"));
-    }
-    roots.push(PathBuf::from(
-        "C:/projects/reference/jira-tui/bin/.jira-tui",
-    ));
-    for root in roots {
-        let Ok(raw) = std::fs::read_to_string(root.join("config.yaml")) else {
-            continue;
-        };
-        let Ok(mut value) = serde_norway::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let secrets = std::fs::read_to_string(root.join("secrets.yaml"))
-            .ok()
-            .and_then(|s| serde_norway::from_str::<serde_json::Value>(&s).ok())
-            .unwrap_or_default();
-        if let Some(email) = secrets["jira"]["email"].as_str() {
-            value["jira"]["email"] = serde_json::json!(email);
-        }
-        let token = secrets["jira"]["api_token"]
-            .as_str()
-            .or_else(|| value["jira"]["api_token"].as_str())
-            .unwrap_or("")
-            .to_string();
-        if let Some(tabs) = value["tabs"].as_array_mut() {
-            for tab in tabs {
-                if tab.get("filter_id").is_none()
-                    && let Some(url) = tab["filter_url"].as_str()
-                    && let Some(id) = url.split("filter=").nth(1)
-                {
-                    tab["filter_id"] = serde_json::json!(id.split('&').next().unwrap_or(""));
-                }
-            }
-        }
-        if let Ok(config) = serde_json::from_value::<Config>(value) {
-            return Some((config, token));
-        }
-    }
-    None
-}
 impl Config {
     pub fn load() -> Result<Self> {
         let c: Self = serde_norway::from_str(&std::fs::read_to_string(path())?)?;
@@ -125,7 +77,7 @@ impl Config {
                 || t.columns.iter().any(|c| {
                     ![
                         "key", "summary", "status", "priority", "assignee", "reporter", "type",
-                        "project", "created", "updated",
+                        "project", "created", "updated", "duedate",
                     ]
                     .contains(&c.as_str())
                 })
@@ -193,6 +145,23 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_due_tab_after_config_roundtrip() {
+        let mut config = Config::initial(
+            "https://example.atlassian.net".into(),
+            "test@example.com".into(),
+            "TEST".into(),
+        );
+        config.tabs[0].label = "Due".into();
+        config.tabs[0].columns = ["duedate", "priority", "assignee", "summary", "status"]
+            .map(String::from)
+            .to_vec();
+        let yaml = serde_norway::to_string(&config).unwrap();
+        let loaded: Config = serde_norway::from_str(&yaml).unwrap();
+        loaded
+            .validate()
+            .expect("Due-date columns must remain supported");
+    }
     #[test]
     fn rejects_ambiguous_tab() {
         let mut c = Config::initial(

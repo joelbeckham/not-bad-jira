@@ -30,7 +30,7 @@
 | Layout | Tab bar as the base layer, plus a push/pop view stack (list → detail → drill-in), as in jira-tui. No split view. |
 | Config | YAML in `%APPDATA%\not-bad-jira\config.yaml`. Tabs are edited in the file; a command opens it. |
 | Credentials | API token in **Windows Credential Manager** (`keyring` crate). Email and base URL live in config. |
-| First run | A small setup screen (URL, email, token), plus a one-time import of an existing `.jira-tui/` config if one is found |
+| First run | A small setup screen (URL, email, token). Existing settings are copied manually once, outside the app; no automatic detection or migration UI. |
 | Cache | Disk cache of tab results and issue details for an instant start (stale-while-revalidate) |
 | Rich text | Markdown in and out. ADF ↔ Markdown conversion that round-trips content Markdown can't express (§6). |
 | Keys | Same vim-style keys as jira-tui, plus **Ctrl+K** for the command palette |
@@ -45,7 +45,7 @@
 | UI | `gpui-kit` | Inputs, lists and tables that render only visible rows, popovers and menus, Markdown view, theming |
 | HTTP | `ureq` (rustls), run on GPUI's background executor | Small, synchronous and simple. No tokio runtime to pay for at startup. |
 | JSON | `serde`, `serde_json` | |
-| YAML | A maintained serde YAML crate (e.g. `serde_norway`) | Kept as YAML so jira-tui configs import as-is |
+| YAML | A maintained serde YAML crate (e.g. `serde_norway`) | Same YAML shape for a one-time manual settings copy |
 | Credentials | `keyring` (Windows Credential Manager backend) | |
 | Markdown parsing | `pulldown-cmark` (GFM: tables, task lists, strikethrough) | Used for the Markdown → ADF direction |
 | Clipboard / browser | GPUI built-ins (`write_to_clipboard`, `open_url`) | |
@@ -60,7 +60,7 @@ Release profile: `lto = "fat"`, `codegen-units = 1`, `strip = true`, `panic = "a
 src/
   main.rs            app bootstrap, window, fonts, theme, keymap registration
   app.rs             root view: title bar, tab bar, view stack, overlays, toasts
-  config/            config.yaml load/save, paths, jira-tui import, credentials
+  config/            config.yaml load/save, paths, credentials
   jira/              REST client, types, endpoints (no UI dependencies)
   adf/               ADF <-> Markdown conversion (pure, heavily unit-tested)
   store/             in-memory issue store, disk cache, refresh/optimistic logic
@@ -133,13 +133,13 @@ Each milestone ends with something you can run.
 - `AGENTS.md`
 
 **M1: Config, auth, first run**
-- `%APPDATA%` paths, config load, Credential Manager, jira-tui import, setup screen, `/myself` check
+- `%APPDATA%` paths, config load, Credential Manager, setup screen, `/myself` check
 - "Open config file" command; reload config when the file changes
 
 **M2: Tabs and issue list** *(the core)*
 - Tabs from filter ID or JQL; per-tab columns; parallel load; disk cache; fast startup path
 - Navigation (`j`/`k`, Home/End, `1`–`9`, `h`/`l`, ←/→), mouse select and double-click, sorting by column (Shift+N, and clicking headers), `/` quick filter, `r` refresh
-- Columns: key, summary, status, priority, assignee, reporter, type, project, created, updated. Priority icons and status colors.
+- Columns: key, summary, status, priority, assignee, reporter, type, project, created, updated, duedate. Priority icons and status colors.
 
 **M3: Issue detail**
 - Instant open from list data, then fill in the rest. Fields, rendered description (ADF → display), subtasks, linked issues, parent, comments.

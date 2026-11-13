@@ -98,7 +98,7 @@ impl Client {
         let mut issues = Vec::new();
         let mut token = Value::Null;
         loop {
-            let mut body = json!({"jql":jql,"maxResults":100,"fields":["summary","status","priority","assignee","reporter","issuetype","project","created","updated"]});
+            let mut body = json!({"jql":jql,"maxResults":100,"fields":["summary","status","priority","assignee","reporter","issuetype","project","created","updated","duedate"]});
             if !token.is_null() {
                 body["nextPageToken"] = token;
             }

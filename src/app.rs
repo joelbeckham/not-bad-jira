@@ -59,7 +59,6 @@ pub struct AppView {
     sort: std::collections::HashMap<usize, (String, u8)>,
     list_scroll: UniformListScrollHandle,
     detail_scroll: ScrollHandle,
-    import_config: Option<Config>,
     pending_config: Option<Config>,
     last_refresh: std::time::Instant,
     cache_writer: mpsc::Sender<(Store, Config)>,
@@ -77,24 +76,6 @@ impl AppView {
             epoch: 0,
         };
         let preview = std::env::args().any(|a| a == "--demo" || a == "--editor-check");
-        let legacy = if crate::config::path().exists() || preview {
-            None
-        } else {
-            crate::config::legacy()
-        };
-        let defaults = legacy
-            .as_ref()
-            .map(|(c, t)| {
-                vec![
-                    c.jira.base_url.clone(),
-                    c.jira.email.clone(),
-                    t.clone(),
-                    c.jira.default_project.clone(),
-                    String::new(),
-                    String::new(),
-                ]
-            })
-            .unwrap_or_else(|| vec![String::new(); 6]);
         let inputs = [
             "https://yourcompany.atlassian.net",
             "you@company.com",
@@ -105,14 +86,7 @@ impl AppView {
         ]
         .iter()
         .enumerate()
-        .map(|(i, p)| {
-            cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(*p)
-                    .masked(i == 2)
-                    .default_value(defaults[i].clone())
-            })
-        })
+        .map(|(i, p)| cx.new(|cx| InputState::new(window, cx).placeholder(*p).masked(i == 2)))
         .collect();
         let config = if preview { None } else { Config::load().ok() };
         let store = config.as_ref().map(Store::load).unwrap_or_default();
@@ -142,7 +116,6 @@ impl AppView {
             sort: Default::default(),
             list_scroll: UniformListScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
-            import_config: legacy.map(|(c, _)| c),
             pending_config: None,
             last_refresh: std::time::Instant::now(),
             cache_writer: crate::store::writer(),
@@ -171,9 +144,6 @@ impl AppView {
             this.connect_existing();
         }
         this.focus.focus(window, cx);
-        if this.import_config.is_some() && !this.demo {
-            this.status = "jira-tui settings found".into();
-        }
         let watch_tx = this.tx.tx.clone();
         std::thread::spawn(move || {
             let mut modified = std::fs::metadata(crate::config::path())
@@ -250,10 +220,7 @@ impl AppView {
             .take(4)
             .map(|s| s.read(cx).value().to_string().trim().to_string())
             .collect();
-        let mut c = Config::initial(values[0].clone(), values[1].clone(), values[3].clone());
-        if let Some(import) = &self.import_config {
-            c.tabs = import.tabs.clone();
-        }
+        let c = Config::initial(values[0].clone(), values[1].clone(), values[3].clone());
         if let Err(e) = c.validate() {
             self.status = e.to_string();
             return;
@@ -269,6 +236,14 @@ impl AppView {
         self.status = "Checking your account…".into();
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<_> {
+                let mut c = c;
+                if let Ok(saved) = Config::load()
+                    && saved.jira.base_url == c.jira.base_url
+                    && saved.jira.email == c.jira.email
+                {
+                    c.tabs = saved.tabs;
+                    c.cache_ttl = saved.cache_ttl;
+                }
                 let client = Client::new(c.clone(), token.clone());
                 let user = client.get("myself")?;
                 c.credential()?.set_password(&token)?;

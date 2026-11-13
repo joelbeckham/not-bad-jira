@@ -72,8 +72,10 @@ Config is `%APPDATA%/not-bad-jira/config.yaml`, cache is
 `%LOCALAPPDATA%/not-bad-jira/cache/issues.json` (8 MiB cap, versioned and bound
 to account and tab queries). Tokens belong only in Windows Credential Manager,
 under service `not-bad-jira`. Never log tokens or authorization headers. Legacy
-jira-tui settings can prefill setup; import is saved only after a successful
-account check. Demo mode bypasses real config, cache and credential import.
+settings were copied once, outside the app. Do not add automatic legacy
+config discovery, import/migration code, compatibility paths or migration UI.
+The app reads only its own config and credentials. Demo mode bypasses real
+config, cache and credentials.
 
 ADF changes need conversion tests: preserve unknown nodes as protected tokens,
 reject missing/duplicated tokens, keep failed drafts, and never replace an
