@@ -17,6 +17,23 @@ For any task that creates or materially changes GPUI user interfaces:
 
 Claude should act as a read-only design critic. It should not modify application code.
 
+## UI copy: no filler
+
+Apply this rule to all future UI changes, on every screen:
+
+- Keep copy concise and functional: headings, field labels, action names, status,
+  validation errors and necessary recovery steps.
+- Do not add slogans, marketing copy, welcome blurbs, value propositions,
+  redundant instructions or decorative helper text.
+- Do not add implementation details or reassurance about storage, security or
+  architecture unless explicitly requested or essential to completing an action.
+- Show helper text only when it is needed to perform the action or prevent data
+  loss, and only while that condition applies.
+- Keep demo/test entry points out of the production UI. Use explicit CLI flags
+  for demo and test modes.
+- Prefer removing unnecessary copy to replacing it with different filler.
+- Do not repeat field labels in placeholders or explain standard OS navigation.
+
 ## Application
 
 Rust 2024, Windows MSVC. GPUI Kit is pinned to 0.9.1 (GPUI 0.3.12);
@@ -71,7 +88,7 @@ window handle. Never send test input to other apps.
 
 Validation on 2026-11-13: 15 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
-filtering, issue-key search + Enter, summary editor, setup and returning to demo.
+filtering, issue-key search + Enter, summary editor and setup.
 Claude's final visual recheck reports the UI ready for user testing. Authenticated
 Jira operations still need validation against an account/project; local HTTP
 fixtures cover search token pagination, 204 updates and authentication errors.

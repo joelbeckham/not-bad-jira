@@ -98,8 +98,8 @@ impl AppView {
         let inputs = [
             "https://yourcompany.atlassian.net",
             "you@company.com",
-            "API token",
-            "Default project (optional)",
+            "",
+            "",
             "Filter issues…",
             "Search commands or jump to an issue…",
         ]
@@ -129,7 +129,7 @@ impl AppView {
             tab: 0,
             selected: 0,
             stack: Vec::new(),
-            status: "Ready to connect".into(),
+            status: String::new(),
             loading: 0,
             tx,
             rx,
@@ -172,7 +172,7 @@ impl AppView {
         }
         this.focus.focus(window, cx);
         if this.import_config.is_some() && !this.demo {
-            this.status = "Found jira-tui settings. Connect to verify and import them.".into();
+            this.status = "jira-tui settings found".into();
         }
         let watch_tx = this.tx.tx.clone();
         std::thread::spawn(move || {
@@ -830,7 +830,7 @@ impl AppView {
             "demo@example.com".into(),
             "NBJ".into(),
         ));
-        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text when editing Markdown","To Do","High","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":{"content":[{"type":"paragraph","content":[{"type":"text","text":"A fast, focused workspace for your Jira issues."}]}]}})}).collect();
+        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text when editing Markdown","To Do","High","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.status = "Demo workspace · sample data".into();
     }
@@ -1014,7 +1014,7 @@ impl AppView {
                 self.demo = false;
                 self.store = Store::default();
                 self.stack.clear();
-                self.status = "Connect your Jira Cloud account".into();
+                self.status.clear();
             }
             "delete" => {
                 if let Some(key) = self.current(cx) {
@@ -1480,14 +1480,46 @@ impl Render for AppView {
                 }
             }
         } else {
-            let form=div().w(px(440.)).flex().flex_col().gap_4()
-                .child(muted("YOUR WORK, WITHOUT THE NOISE"))
-                .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).child("Connect to Jira"))
-                .child(div().text_color(rgb(0xa5afbf)).child("A fast, focused home for your issues. Connect your Jira Cloud account to get started."))
-                .children(["Jira site","Email address","API token","Default project"].iter().enumerate().map(|(i,label)| div().flex().flex_col().gap_2().child(muted(*label)).child(Input::new(&self.inputs[i]))))
-                .child(muted("Your API token is stored in Windows Credential Manager."))
-                .child(Button::new("connect").primary().bg(rgb(0x3776c8)).text_color(rgb(0xffffff)).label("Connect account").on_click(cx.listener(|this,_,_,cx|{this.connect(cx);cx.notify();})))
-                .child(Button::new("demo").label("Explore a demo workspace").on_click(cx.listener(|this,_,_,cx|{this.demo();cx.notify();})));
+            let form = div()
+                .w(px(440.))
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Connect to Jira"),
+                )
+                .children(
+                    [
+                        "Jira site",
+                        "Email address",
+                        "API token",
+                        "Default project (optional)",
+                    ]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, label)| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(muted(*label))
+                            .child(Input::new(&self.inputs[i]).aria_label(*label))
+                    }),
+                )
+                .child(
+                    Button::new("connect")
+                        .primary()
+                        .bg(rgb(0x3776c8))
+                        .text_color(rgb(0xffffff))
+                        .label("Connect account")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.connect(cx);
+                            cx.notify();
+                        })),
+                );
             body = body.items_center().justify_center().child(form);
         }
         if self.palette {
@@ -1569,7 +1601,7 @@ impl Render for AppView {
                 .child(div().text_size(px(22.)).child("Commands"))
                 .child(Input::new(&self.inputs[5]).small())
                 .child(results);
-        } else if let Some((key, kind, _)) = &self.edit {
+        } else if let Some((key, kind, document)) = &self.edit {
             let single = kind == "summary" || kind == "create";
             let editor_area = if single {
                 div()
@@ -1606,11 +1638,10 @@ impl Render for AppView {
                 .gap_4()
                 .child(muted(format!("{} / Edit {}", key, kind)))
                 .child(editor_area)
-                .child(muted(if single {
-                    "A short summary for this issue."
-                } else {
-                    "Markdown ? Keep [ADF:n] protected content tokens intact."
-                }))
+                .children(
+                    (!single && document.markdown.contains("[ADF:"))
+                        .then(|| muted("Leave [ADF:n] markers unchanged.")),
+                )
                 .child(
                     div()
                         .flex()
@@ -1682,14 +1713,7 @@ impl Render for AppView {
                 ))
                 .child(self.shortcut_button("footer-close", &["Esc"], "Close", "escape", cx))
         } else if self.config.is_none() {
-            shortcuts.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(keycap("Tab"))
-                    .child(muted("Move between fields")),
-            )
+            shortcuts
         } else if self.edit.is_some() {
             shortcuts
                 .child(self.shortcut_button(
