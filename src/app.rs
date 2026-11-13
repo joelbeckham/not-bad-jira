@@ -1,8 +1,10 @@
 use crate::{
     config::Config,
     jira::{Client, Issue},
+    picker::{Choice, Picker},
     store::Store,
 };
+use gpui_kit::base::Disableable;
 use gpui_kit::component::{
     Sizable, TitleBar,
     button::Button,
@@ -11,9 +13,12 @@ use gpui_kit::component::{
     menu::{ContextMenuExt, PopupMenuItem},
     tooltip::Tooltip,
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::{Value, json};
-use std::{sync::mpsc, time::Duration};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc, time::Duration};
+
+type FieldBounds = Rc<RefCell<HashMap<(String, String), Bounds<Pixels>>>>;
 
 enum Message {
     ConfigChanged(Result<Config, String>),
@@ -21,7 +26,7 @@ enum Message {
     Tab(usize, u64, Result<Vec<Issue>, String>),
     Detail(u64, Result<Issue, String>),
     Saved(String, Option<Issue>, Result<Value, String>),
-    Choices(String, String, Result<Vec<(String, String)>, String>),
+    Choices(u64, Result<Vec<Choice>, String>),
 }
 #[derive(Clone)]
 struct Sender {
@@ -50,9 +55,12 @@ pub struct AppView {
     rx: mpsc::Receiver<(u64, Message)>,
     demo: bool,
     edit: Option<(String, String, crate::adf::Document)>,
-    choices: Vec<(String, String)>,
-    picker: Option<String>,
-    picker_key: Option<String>,
+    picker: Option<Picker>,
+    picker_request: u64,
+    picker_input: Entity<InputState>,
+    picker_scroll: UniformListScrollHandle,
+    picker_anchor: Point<Pixels>,
+    field_bounds: FieldBounds,
     palette: bool,
     subscriptions: Vec<Subscription>,
     create_summary: String,
@@ -93,6 +101,7 @@ impl AppView {
         let store = config.as_ref().map(Store::load).unwrap_or_default();
         let editor = cx.new(|cx| zorite_editor::EditorState::new(window, cx));
         let summary_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue summary"));
+        let picker_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         let mut this = Self {
             focus: cx.focus_handle(),
             config,
@@ -110,9 +119,12 @@ impl AppView {
             rx,
             demo: false,
             edit: None,
-            choices: Vec::new(),
             picker: None,
-            picker_key: None,
+            picker_request: 0,
+            picker_input,
+            picker_scroll: UniformListScrollHandle::new(),
+            picker_anchor: point(px(24.), px(120.)),
+            field_bounds: Default::default(),
             palette: false,
             sort: Default::default(),
             list_scroll: UniformListScrollHandle::new(),
@@ -179,6 +191,20 @@ impl AppView {
             |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.palette_execute(window, cx);
+                }
+            },
+        ));
+        this.subscriptions.push(cx.subscribe_in(
+            &this.picker_input,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(picker) = this.picker.as_mut()
+                {
+                    picker.set_query(this.picker_input.read(cx).value().to_string());
+                    this.picker_scroll
+                        .scroll_to_item(picker.selected, ScrollStrategy::Nearest);
+                    cx.notify();
                 }
             },
         ));
@@ -404,19 +430,21 @@ impl AppView {
                         }
                     }
                 }
-                Message::Choices(kind, key, result) => match result {
-                    Ok(choices) => {
-                        let quick_done = kind == "done" && choices.len() == 1;
-                        self.choices = choices;
-                        self.picker = Some(kind);
-                        self.picker_key = Some(key);
-                        if quick_done {
-                            let (id, label) = self.choices[0].clone();
-                            self.apply_choice(id, label, cx);
+                Message::Choices(request, result) => {
+                    if let Some(picker) = self.picker.as_mut().filter(|p| p.request == request) {
+                        match result {
+                            Ok(choices) => {
+                                picker.set_choices(choices);
+                                self.picker_scroll
+                                    .scroll_to_item(picker.selected, ScrollStrategy::Nearest);
+                            }
+                            Err(error) => {
+                                picker.loading = false;
+                                picker.error = Some(error);
+                            }
                         }
                     }
-                    Err(e) => self.status = format!("Could not load choices: {e}"),
-                },
+                }
             }
         }
         if changed {
@@ -626,27 +654,17 @@ impl AppView {
                 return;
             }
             self.create_summary = text.trim().to_string();
+            self.start_picker("create", String::new(), window, cx);
+            let request = self.picker_request;
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<_> {
                     let data = client.get(&format!("issue/createmeta/{project}/issuetypes"))?;
-                    Ok(data["issueTypes"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|v| {
-                            Some((v["id"].as_str()?.into(), v["name"].as_str()?.into()))
-                        })
-                        .collect())
+                    Ok(Choice::from_jira("create", &data["issueTypes"]))
                 })();
-                let _ = tx.send(Message::Choices(
-                    "create".into(),
-                    String::new(),
-                    result.map_err(|e| e.to_string()),
-                ));
+                let _ = tx.send(Message::Choices(request, result.map_err(|e| e.to_string())));
             });
             self.edit = None;
-            self.focus.focus(window, cx);
             return;
         }
         if text.trim().is_empty() && kind != "description" {
@@ -686,19 +704,92 @@ impl AppView {
         );
         self.focus.focus(window, cx);
     }
-    fn choose(&mut self, kind: &str, cx: &mut Context<Self>) {
-        let Some(key) = self.current(cx) else {
+    fn start_picker(
+        &mut self,
+        kind: &str,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker_request += 1;
+        let field = if kind == "done" { "status" } else { kind };
+        self.picker_anchor = self
+            .field_bounds
+            .borrow()
+            .get(&(key.clone(), field.into()))
+            .map(|bounds| bounds.bottom_left() + point(px(0.), px(4.)))
+            .unwrap_or(point(px(24.), px(120.)));
+        self.picker = Some(Picker::new(kind, key, self.picker_request));
+        if let Some(picker) = self.picker.as_mut()
+            && let Some(issue) = self.store.issues.get(&picker.key)
+        {
+            picker.set_current(issue.field(field), issue.fields[field].clone());
+        }
+        self.picker_scroll = UniformListScrollHandle::new();
+        self.picker_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn choose(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(key) = self.current(cx) {
+            self.choose_for(kind, key, window, cx);
+        }
+    }
+
+    fn choose_for(&mut self, kind: &str, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
             return;
-        };
-        let Some(client) = self.client.clone() else {
+        }
+        if !self.demo && self.client.is_none() {
             self.status = "Connect your account to edit issues.".into();
             return;
-        };
+        }
+        self.start_picker(kind, key.clone(), window, cx);
+        if self.demo {
+            let data = match kind {
+                "status" | "done" => json!([
+                    {"id":"11","name":"To Do","to":{"id":"1","name":"To Do","statusCategory":{"key":"new"}}},
+                    {"id":"21","name":"In Progress","to":{"id":"2","name":"In Progress","statusCategory":{"key":"indeterminate"}}},
+                    {"id":"31","name":"Done","to":{"id":"3","name":"Done","statusCategory":{"key":"done"}}}
+                ]),
+                "priority" => json!([
+                    {"id":"1","name":"Highest"}, {"id":"2","name":"High"},
+                    {"id":"3","name":"Medium"}, {"id":"4","name":"Low"}, {"id":"5","name":"Lowest"}
+                ]),
+                _ => json!([
+                    {"accountId":"alex","displayName":"Alex Morgan"},
+                    {"accountId":"sam","displayName":"Sam Rivera"},
+                    {"accountId":"alexandra","displayName":"Alexandra Morgan-Rivera"},
+                    {"accountId":"casey","displayName":"Casey Patel"},
+                    {"accountId":"dana","displayName":"Dana Lee"},
+                    {"accountId":"jordan","displayName":"Jordan Kim"},
+                    {"accountId":"morgan","displayName":"Morgan Chen"},
+                    {"accountId":"riley","displayName":"Riley Brooks"},
+                    {"accountId":"taylor","displayName":"Taylor Reed"},
+                    {"accountId":"avery","displayName":"Avery Lopez"},
+                    {"accountId":"cameron","displayName":"Cameron Shaw"},
+                    {"accountId":"quinn","displayName":"Quinn Williams"}
+                ]),
+            };
+            self.picker
+                .as_mut()
+                .unwrap()
+                .set_choices(Choice::from_jira(kind, &data));
+            self.picker_scroll.scroll_to_item(
+                self.picker.as_ref().unwrap().selected,
+                ScrollStrategy::Nearest,
+            );
+            return;
+        }
+        let client = self.client.clone().unwrap();
+        let request = self.picker_request;
         let tx = self.tx.clone();
         let kind = kind.to_string();
-        self.status = "Loading choices…".into();
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<Vec<(String, String)>> {
+            let result = (|| -> anyhow::Result<Vec<Choice>> {
                 let data = if kind == "status" || kind == "done" {
                     client.get(&format!("issue/{key}/transitions"))?["transitions"].clone()
                 } else if kind == "priority" {
@@ -708,47 +799,47 @@ impl AppView {
                         "user/assignable/search?issueKey={key}&maxResults=100"
                     ))?
                 };
-                Ok(data
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|v| kind != "done" || v["to"]["statusCategory"]["key"] == "done")
-                    .filter_map(|v| {
-                        Some((
-                            v[if kind == "assignee" {
-                                "accountId"
-                            } else {
-                                "id"
-                            }]
-                            .as_str()?
-                            .into(),
-                            v[if kind == "assignee" {
-                                "displayName"
-                            } else {
-                                "name"
-                            }]
-                            .as_str()?
-                            .into(),
-                        ))
-                    })
-                    .collect())
+                Ok(Choice::from_jira(&kind, &data))
             })();
-            let _ = tx.send(Message::Choices(
-                kind,
-                key,
-                result.map_err(|e| e.to_string()),
-            ));
+            let _ = tx.send(Message::Choices(request, result.map_err(|e| e.to_string())));
         });
     }
-    fn apply_choice(&mut self, id: String, label: String, cx: &mut Context<Self>) {
-        let key = self
-            .picker_key
-            .take()
-            .or_else(|| self.current(cx))
-            .unwrap_or_default();
-        let Some(kind) = self.picker.take() else {
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn select_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(choice) = self
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.current())
+            .cloned()
+        {
+            self.apply_choice(choice, cx);
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn apply_choice(&mut self, choice: Choice, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.take() else {
             return;
         };
+        if picker.is_current(&choice) || choice.id.is_empty() {
+            return;
+        }
+        let kind = picker.kind;
+        let key = picker.key;
+        let id = choice.id;
+        if self.demo && ["status", "done", "priority", "assignee"].contains(&kind.as_str()) {
+            if let Some(issue) = self.store.issues.get_mut(&key) {
+                issue.fields[if kind == "done" { "status" } else { &kind }] = choice.value;
+            }
+            return;
+        }
         if kind == "create" {
             let project = self.config.as_ref().unwrap().jira.default_project.clone();
             self.mutate(String::new(),"POST","issue".into(),json!({"fields":{"project":{"key":project},"issuetype":{"id":id},"summary":self.create_summary}}),None);
@@ -766,7 +857,7 @@ impl AppView {
                 "POST",
                 format!("issue/{key}/transitions"),
                 json!({"transition":{"id":id}}),
-                Some(json!({"status":{"name":label}})),
+                Some(json!({"status":choice.value})),
             );
         } else {
             let field = if kind == "assignee" {
@@ -774,20 +865,312 @@ impl AppView {
             } else {
                 json!({"id":id})
             };
-            let preview = if kind == "assignee" {
-                json!({"displayName":label})
-            } else {
-                json!({"name":label})
-            };
             self.mutate(
                 key.clone(),
                 "PUT",
                 format!("issue/{key}"),
                 json!({"fields":{kind.clone():field}}),
-                Some(json!({kind:preview})),
+                Some(json!({kind:choice.value})),
             );
         }
+        cx.notify();
     }
+
+    fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match event.keystroke.key.as_str() {
+            "escape" => self.close_picker(window, cx),
+            "enter" => self.select_picker(window, cx),
+            "up" | "down" => {
+                picker.move_selection(event.keystroke.key == "down");
+                self.picker_scroll
+                    .scroll_to_item(picker.selected, ScrollStrategy::Nearest);
+                cx.notify();
+            }
+            _ => return,
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+    fn render_shortcuts(&self, cx: &mut Context<Self>) -> Div {
+        let shortcuts = div().flex().items_center().gap_4().flex_shrink_0();
+        if self.palette {
+            shortcuts
+                .child(self.shortcut_button(
+                    "footer-run",
+                    &["Enter"],
+                    "Run or open",
+                    "palette-enter",
+                    cx,
+                ))
+                .child(self.shortcut_button("footer-close", &["Esc"], "Close", "escape", cx))
+        } else if self.picker.is_some() {
+            shortcuts
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(self.shortcut_button("picker-up", &["Up"], "", "picker-up", cx))
+                        .child(self.shortcut_button(
+                            "picker-down",
+                            &["Down"],
+                            "Move",
+                            "picker-down",
+                            cx,
+                        )),
+                )
+                .child(self.shortcut_button(
+                    "picker-select",
+                    &["Enter"],
+                    "Select",
+                    "picker-select",
+                    cx,
+                ))
+                .child(self.shortcut_button("picker-close", &["Esc"], "Close", "escape", cx))
+        } else if self.config.is_none() {
+            shortcuts
+        } else if self.edit.is_some() {
+            shortcuts
+                .child(self.shortcut_button(
+                    "footer-save",
+                    &["Ctrl+Enter"],
+                    "Save",
+                    "save-edit",
+                    cx,
+                ))
+                .child(self.shortcut_button("footer-cancel", &["Esc"], "Cancel", "escape", cx))
+        } else {
+            shortcuts
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(self.shortcut_button("footer-down", &["J"], "", "j", cx))
+                        .child(self.shortcut_button("footer-up", &["K"], "", "k", cx))
+                        .child(muted("Move")),
+                )
+                .child(self.shortcut_button("footer-open", &["Enter"], "Open", "enter", cx))
+                .child(self.shortcut_button("footer-filter", &["/"], "Filter", "/", cx))
+                .child(self.shortcut_button("footer-refresh", &["R"], "Refresh", "r", cx))
+                .child(self.shortcut_button(
+                    "footer-commands",
+                    &["Ctrl+K"],
+                    "Commands",
+                    "palette",
+                    cx,
+                ))
+        }
+    }
+
+    fn field_trigger(
+        &self,
+        kind: &str,
+        issue: &Issue,
+        content: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = issue.key.clone();
+        let field = kind.to_string();
+        let bounds_key = (key.clone(), field.clone());
+        let bounds = self.field_bounds.clone();
+        let open = self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.kind == kind && p.key == issue.key);
+        div()
+            .on_children_prepainted(move |children, _, _| {
+                if let Some(rect) = children.first() {
+                    bounds.borrow_mut().insert(bounds_key.clone(), *rect);
+                }
+            })
+            .child(
+                Button::new(SharedString::from(format!("field-{kind}-{}", issue.key)))
+                    .ghost()
+                    .small()
+                    .h(px(24.))
+                    .px_1()
+                    .disabled(self.saving)
+                    .when(open, |button| button.bg(rgb(0x242d3a)))
+                    .accessibility_label(format!("Change {kind}: {}", issue.field(kind)))
+                    .child(content)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this
+                            .picker
+                            .as_ref()
+                            .is_some_and(|p| p.kind == field && p.key == key)
+                        {
+                            this.close_picker(window, cx);
+                        } else {
+                            this.choose_for(&field, key.clone(), window, cx);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_choice_row(
+        &self,
+        visible_index: usize,
+        request: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let picker = self.picker.as_ref().unwrap();
+        let choice = picker.choices[picker.visible[visible_index]].clone();
+        let selected = visible_index == picker.selected;
+        let current = picker.is_current(&choice);
+        let has_icons = matches!(picker.kind.as_str(), "priority" | "status" | "done");
+        let content = match picker.kind.as_str() {
+            "priority" => crate::priority::detail(choice.label.clone()).into_any_element(),
+            "status" | "done" => crate::status::detail(&choice.value).into_any_element(),
+            _ => div()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(choice.label.clone())
+                .into_any_element(),
+        };
+        Button::new(("picker-choice", visible_index))
+            .ghost()
+            .w_full()
+            .h(px(32.))
+            .px_2()
+            .when(!has_icons, |button| button.px_3())
+            .justify_start()
+            .bg(rgb(if selected { 0x2d405c } else { 0x20252e }))
+            .accessibility_label(choice.label.clone())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().overflow_hidden().child(content))
+                    .when(current, |row| {
+                        row.child(
+                            gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Check)
+                                .size(px(14.))
+                                .flex_shrink_0()
+                                .text_color(rgb(0x929cad)),
+                        )
+                    }),
+            )
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                if *hovered
+                    && let Some(picker) = this.picker.as_mut()
+                    && picker.request == request
+                    && picker.selected != visible_index
+                {
+                    picker.selected = visible_index;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.picker.as_ref().is_some_and(|p| p.request == request) {
+                    this.apply_choice(choice.clone(), cx);
+                    this.focus.focus(window, cx);
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn render_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let picker = self.picker.as_ref().unwrap();
+        let kind = picker.kind.clone();
+        let count = picker.visible.len();
+        let request = picker.request;
+        let trigger_bounds = self
+            .field_bounds
+            .borrow()
+            .get(&(
+                picker.key.clone(),
+                if kind == "done" { "status" } else { &kind }.into(),
+            ))
+            .copied();
+        let anchor = self
+            .field_bounds
+            .borrow()
+            .get(&(
+                picker.key.clone(),
+                if kind == "done" { "status" } else { &kind }.into(),
+            ))
+            .map(|bounds| bounds.bottom_left() + point(px(0.), px(4.)))
+            .unwrap_or(self.picker_anchor);
+        let mut popup = div()
+            .id("field-picker")
+            .w(px(288.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(rgb(0x20252e))
+            .border_1()
+            .border_color(rgb(0x414b5b))
+            .rounded_md()
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div().p_1().child(
+                    Input::new(&self.picker_input)
+                        .small()
+                        .focus_bordered(false)
+                        .border_color(rgb(0x5b8dcc))
+                        .rounded_sm()
+                        .aria_label(format!(
+                            "Filter {}",
+                            if kind == "done" { "status" } else { &kind }
+                        )),
+                ),
+            );
+        if picker.loading {
+            popup = popup.child(div().p_3().child(muted("Loading…")));
+        } else if let Some(error) = &picker.error {
+            popup = popup.child(div().p_3().text_color(rgb(0xf07b84)).child(error.clone()));
+        } else if count == 0 {
+            popup = popup.child(div().p_3().child(muted("No matches")));
+        } else {
+            popup = popup.child(
+                uniform_list(
+                    "picker-options",
+                    count,
+                    cx.processor(
+                        move |this: &mut Self,
+                              range: std::ops::Range<usize>,
+                              _: &mut Window,
+                              cx: &mut Context<Self>| {
+                            range
+                                .map(|visible_index| {
+                                    this.render_choice_row(visible_index, request, cx)
+                                })
+                                .collect()
+                        },
+                    ),
+                )
+                .h(px((count.min(8) * 32) as f32))
+                .track_scroll(&self.picker_scroll),
+            );
+        }
+        let position = if let Some(bounds) = trigger_bounds {
+            anchored()
+                .attach(bounds, Anchor::BottomLeft)
+                .offset(point(px(0.), px(4.)))
+        } else {
+            anchored().position(anchor)
+        };
+        deferred(position.snap_to_window_with_margin(px(8.)).child(popup))
+            .with_priority(100)
+            .into_any_element()
+    }
+
     fn demo(&mut self) {
         self.tx.epoch += 1;
         self.connecting = false;
@@ -818,6 +1201,9 @@ impl AppView {
             self.save_edit(window, cx);
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if self.picker.is_some() {
             return;
         }
         if event.keystroke.modifiers.control && event.keystroke.key == "k" {
@@ -861,7 +1247,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.edit.is_some() || !self.focus.is_focused(window) {
+        if self.edit.is_some() || self.picker.is_some() || !self.focus.is_focused(window) {
             cx.propagate();
             return;
         }
@@ -953,9 +1339,9 @@ impl AppView {
             "t" => self.begin_edit("summary", window, cx),
             "e" => self.begin_edit("description", window, cx),
             "m" => self.begin_edit("comment", window, cx),
-            "s" => self.choose("status", cx),
-            "p" => self.choose("priority", cx),
-            "a" => self.choose("assignee", cx),
+            "s" => self.choose("status", window, cx),
+            "p" => self.choose("priority", window, cx),
+            "a" => self.choose("assignee", window, cx),
             "ctrl-," => {
                 cx.open_url(&format!(
                     "file:///{}",
@@ -994,9 +1380,11 @@ impl AppView {
             }
             "delete" => {
                 if let Some(key) = self.current(cx) {
-                    self.picker = Some("delete".into());
-                    self.picker_key = Some(key.clone());
-                    self.choices = vec![(key, "Delete permanently".into())];
+                    self.start_picker("delete", key.clone(), window, cx);
+                    self.picker
+                        .as_mut()
+                        .unwrap()
+                        .set_choices(vec![Choice::named(&key, "Delete permanently")]);
                 }
             }
             "i" => {
@@ -1007,7 +1395,7 @@ impl AppView {
                 }
             }
             "d" => {
-                self.choose("done", cx);
+                self.choose("done", window, cx);
                 self.status = "Choose the workflow's Done transition".into();
             }
             "c" => {
@@ -1129,6 +1517,8 @@ fn cell(text: String, field: &str) -> Div {
             .min_w_0()
             .pr_4()
             .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
             .child(text)
     } else {
         column(
@@ -1276,38 +1666,44 @@ impl Render for AppView {
                                 )
                                 .child(
                                     div()
-                                        .h(px(20.))
+                                        .h(px(24.))
                                         .flex()
                                         .items_center()
                                         .gap_5()
                                         .whitespace_nowrap()
                                         .overflow_hidden()
-                                        .child(crate::status::detail(&issue.fields["status"]))
-                                        .child(crate::priority::detail(issue.field("priority")))
                                         .child(
-                                            div()
-                                                .id("detail-assignee")
-                                                .flex_1()
-                                                .min_w_0()
-                                                .text_color(rgb(0xa4afc0))
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child(muted("Assignee").flex_shrink_0())
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .text_ellipsis()
-                                                        .child(issue.field("assignee")),
-                                                )
-                                                .tooltip({
-                                                    let assignee = issue.field("assignee");
-                                                    move |window, cx| {
-                                                        Tooltip::new(assignee.clone())
-                                                            .build(window, cx)
-                                                    }
-                                                }),
+                                            self.field_trigger(
+                                                "status",
+                                                &issue,
+                                                crate::status::detail(&issue.fields["status"])
+                                                    .into_any_element(),
+                                                cx,
+                                            ),
+                                        )
+                                        .child(
+                                            self.field_trigger(
+                                                "priority",
+                                                &issue,
+                                                crate::priority::detail(issue.field("priority"))
+                                                    .into_any_element(),
+                                                cx,
+                                            ),
+                                        )
+                                        .child(
+                                            self.field_trigger(
+                                                "assignee",
+                                                &issue,
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .text_color(rgb(0xa4afc0))
+                                                    .child(muted("Assignee"))
+                                                    .child(issue.field("assignee"))
+                                                    .into_any_element(),
+                                                cx,
+                                            ),
                                         ),
                                 ),
                         )
@@ -1475,7 +1871,33 @@ impl Render for AppView {
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
-                                                            .child(icon)
+                                                            .child(this.field_trigger(
+                                                                field, issue, icon, cx,
+                                                            ))
+                                                            .into_any_element();
+                                                    }
+                                                    if field == "assignee" {
+                                                        return div()
+                                                            .w(px(160.))
+                                                            .pr_3()
+                                                            .flex_shrink_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .overflow_hidden()
+                                                            .child(
+                                                                this.field_trigger(
+                                                                    field,
+                                                                    issue,
+                                                                    div()
+                                                                        .text_color(rgb(0xa4afc0))
+                                                                        .overflow_hidden()
+                                                                        .whitespace_nowrap()
+                                                                        .text_ellipsis()
+                                                                        .child(issue.field(field))
+                                                                        .into_any_element(),
+                                                                    cx,
+                                                                ),
+                                                            )
                                                             .into_any_element();
                                                     }
                                                     let value = if field == "key" {
@@ -1739,80 +2161,42 @@ impl Render for AppView {
                                 })),
                         ),
                 );
-        } else if let Some(kind) = &self.picker {
-            body =
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .p_6()
-                    .gap_3()
-                    .child(div().text_size(px(22.)).child(format!("Choose {kind}")))
-                    .child(Button::new("cancel-picker").label("Cancel   Esc").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.picker = None;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(div().id("choices").overflow_y_scroll().children(
-                        self.choices.iter().enumerate().map(|(i, (id, label))| {
-                            let id = id.clone();
-                            let label = label.clone();
-                            Button::new(("choice", i))
-                                .label(label.clone())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.apply_choice(id.clone(), label.clone(), cx);
-                                    cx.notify();
-                                }))
-                        }),
-                    ));
-        }
-        let shortcuts = div().flex().items_center().gap_4().flex_shrink_0();
-        let shortcuts = if self.palette {
-            shortcuts
-                .child(self.shortcut_button(
-                    "footer-run",
-                    &["Enter"],
-                    "Run or open",
-                    "palette-enter",
-                    cx,
-                ))
-                .child(self.shortcut_button("footer-close", &["Esc"], "Close", "escape", cx))
-        } else if self.config.is_none() {
-            shortcuts
-        } else if self.edit.is_some() {
-            shortcuts
-                .child(self.shortcut_button(
-                    "footer-save",
-                    &["Ctrl+Enter"],
-                    "Save",
-                    "save-edit",
-                    cx,
-                ))
-                .child(self.shortcut_button("footer-cancel", &["Esc"], "Cancel", "escape", cx))
-        } else {
-            shortcuts
+        } else if let Some(picker) = &self.picker
+            && picker.kind == "delete"
+        {
+            body = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .p_6()
+                .gap_3()
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(self.shortcut_button("footer-down", &["J"], "", "j", cx))
-                        .child(self.shortcut_button("footer-up", &["K"], "", "k", cx))
-                        .child(muted("Move")),
+                        .text_size(px(22.))
+                        .child(format!("Delete {}?", picker.key)),
                 )
-                .child(self.shortcut_button("footer-open", &["Enter"], "Open", "enter", cx))
-                .child(self.shortcut_button("footer-filter", &["/"], "Filter", "/", cx))
-                .child(self.shortcut_button("footer-refresh", &["R"], "Refresh", "r", cx))
-                .child(self.shortcut_button(
-                    "footer-commands",
-                    &["Ctrl+K"],
-                    "Commands",
-                    "palette",
-                    cx,
-                ))
-        };
+                .child(
+                    Button::new("cancel-picker")
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, window, cx| this.close_picker(window, cx))),
+                )
+                .child(
+                    Button::new("confirm-delete")
+                        .label("Delete permanently")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.select_picker(window, cx)),
+                        ),
+                );
+        }
+        let shortcuts = self.render_shortcuts(cx);
+        let popup = self
+            .picker
+            .as_ref()
+            .filter(|p| p.kind != "delete")
+            .map(|_| self.render_picker(cx));
         div()
+            .id("workspace")
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -1823,6 +2207,7 @@ impl Render for AppView {
             .track_focus(&self.focus)
             .key_context("Workspace")
             .on_action(cx.listener(Self::command))
+            .capture_key_down(cx.listener(Self::picker_key))
             .on_key_down(cx.listener(Self::key))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1830,6 +2215,11 @@ impl Render for AppView {
                     this.focus.focus(window, cx);
                 }),
             )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.picker.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .child(
                 TitleBar::new().child(
                     div()
@@ -1851,6 +2241,7 @@ impl Render for AppView {
                 ),
             )
             .child(body)
+            .children(popup)
             .child(
                 div()
                     .h(px(36.))
@@ -1935,6 +2326,8 @@ impl AppView {
         let name = match command {
             "j" => "Move down",
             "k" => "Move up",
+            "picker-up" => "Previous option",
+            "picker-down" => "Next option",
             _ => label,
         };
         let content = div()
@@ -1956,7 +2349,18 @@ impl AppView {
             .accessibility_label(format!("{} ({})", name, keys.join(" / ")))
             .child(content)
             .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
                 match command {
+                    "picker-up" | "picker-down" => {
+                        if let Some(picker) = this.picker.as_mut() {
+                            picker.move_selection(command == "picker-down");
+                            this.picker_scroll
+                                .scroll_to_item(picker.selected, ScrollStrategy::Nearest);
+                            this.picker_input
+                                .update(cx, |input, cx| input.focus(window, cx));
+                        }
+                    }
+                    "picker-select" => this.select_picker(window, cx),
                     "palette" => {
                         this.palette = true;
                         this.inputs[5].update(cx, |s, cx| {

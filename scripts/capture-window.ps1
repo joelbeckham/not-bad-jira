@@ -1,4 +1,4 @@
-param([string]$Output = 'design/reviews/native-demo.png')
+param([string]$Output = 'design/reviews/native-demo.png', [int]$TargetProcessId)
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
@@ -11,8 +11,8 @@ public class CaptureWindow {
 }
 "@
 [CaptureWindow]::SetProcessDPIAware() | Out-Null
-$process = Get-Process not-bad-jira | Where-Object MainWindowHandle -ne 0 | Sort-Object StartTime | Select-Object -Last 1
-if (!$process) { throw 'No app window found' }
+$process = if ($TargetProcessId) { Get-Process -Id $TargetProcessId -ErrorAction Stop } else { Get-Process not-bad-jira | Where-Object MainWindowHandle -ne 0 | Sort-Object StartTime | Select-Object -Last 1 }
+if (!$process -or $process.ProcessName -ne 'not-bad-jira' -or $process.MainWindowHandle -eq 0) { throw 'No test app window found' }
 $rect = New-Object CaptureWindow+RECT
 [CaptureWindow]::GetWindowRect($process.MainWindowHandle,[ref]$rect) | Out-Null
 $bitmap = New-Object System.Drawing.Bitmap ($rect.Right-$rect.Left),($rect.Bottom-$rect.Top)

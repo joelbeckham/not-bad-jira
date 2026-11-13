@@ -68,6 +68,13 @@ before an edit cannot replace its result. List refreshes merge fields and retain
 cached descriptions/comments. Config changes are read on a worker; reload waits for active edits and
 saves. Cache writes go through a serial worker and atomic file replacement.
 
+`src/picker.rs` owns filtering and selection without GPUI dependencies. Field
+popups keep the filter focused; navigation keys are captured before input editing
+actions. Request IDs discard responses for closed or replaced pickers. Keep the
+transition action ID separate from the target status ID, and preserve target
+status categories for icons. Demo field selections change sample data only in
+memory.
+
 Config is `%APPDATA%/not-bad-jira/config.yaml`, cache is
 `%LOCALAPPDATA%/not-bad-jira/cache/issues.json` (8 MiB cap, versioned and bound
 to account and tab queries). Tokens belong only in Windows Credential Manager,
@@ -87,10 +94,15 @@ Native screenshots live under design/reviews. Capture is DPI-aware; Windows'
 invisible resize border may appear around a window. Prefer accessibility actions
 for native smoke tests. Keyboard smoke tests post only to the test app's exact
 window handle. Never send test input to other apps.
+Pass `-TargetProcessId` to native smoke and capture scripts so a closed preview
+cannot redirect a check to another app window.
 
-Validation on 2026-11-13: 15 tests pass; Clippy passes with `-D warnings`.
+Validation on 2026-11-13: 21 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
+Field picker checks cover live typing, retained filter focus, Up/Down navigation,
+Enter selection, mouse selection, Escape, no matches, current-value preservation
+and scrolling to a current value beyond the first eight options.
 Claude's final visual recheck reports the UI ready for user testing. Authenticated
 Jira operations still need validation against an account/project; local HTTP
 fixtures cover search token pagination, 204 updates and authentication errors.

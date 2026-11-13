@@ -7,6 +7,7 @@ mod app;
 mod config;
 mod indicator;
 mod jira;
+mod picker;
 mod priority;
 mod status;
 mod store;

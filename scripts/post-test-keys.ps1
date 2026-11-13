@@ -1,4 +1,4 @@
-param([int[]]$VirtualKeys=@(0x4A,0x0D))
+param([int[]]$VirtualKeys=@(0x4A,0x0D), [int]$TargetProcessId)
 Add-Type @"
 using System; using System.Runtime.InteropServices;
 public class DirectKeys {
@@ -6,8 +6,8 @@ public class DirectKeys {
  [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code,uint type);
 }
 "@
-$process=Get-Process not-bad-jira | Where-Object MainWindowHandle -ne 0 | Sort-Object StartTime | Select-Object -Last 1
-if (!$process){throw 'No app window'}
+$process=if ($TargetProcessId) { Get-Process -Id $TargetProcessId -ErrorAction Stop } else { Get-Process not-bad-jira | Where-Object MainWindowHandle -ne 0 | Sort-Object StartTime | Select-Object -Last 1 }
+if (!$process -or $process.ProcessName -ne 'not-bad-jira' -or $process.MainWindowHandle -eq 0) { throw 'No test app window found' }
 foreach ($virtualKey in $VirtualKeys) {
  $scan=[DirectKeys]::MapVirtualKey($virtualKey,0)
  $down=[long]1 -bor ([long]$scan -shl 16)
