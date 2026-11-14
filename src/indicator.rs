@@ -5,7 +5,14 @@ use std::borrow::Cow;
 
 gpui_kit::assets::icon_assets!(
     IndicatorAssets,
-    [ChevronsUp, ChevronsDown, Equal, CircleDashed, CircleDot]
+    [
+        ChevronsUp,
+        ChevronsDown,
+        Equal,
+        CircleDashed,
+        CircleDot,
+        CircleUserRound
+    ]
 );
 
 pub struct Assets;

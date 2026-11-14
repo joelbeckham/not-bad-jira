@@ -75,6 +75,15 @@ transition action ID separate from the target status ID, and preserve target
 status categories for icons. Demo field selections change sample data only in
 memory.
 
+`src/avatar.rs` loads assignee avatars from Jira's `avatarUrls`. Rendering only
+uses memory and a bounded queue; a separate disk worker keeps cache hits clear
+of the two HTTP workers. Cached images work before account authentication and
+offline, refresh after 24 hours, and remain visible if refreshing fails. Memory
+holds up to 256 avatars; `cache/avatars` holds up to 512 PNGs / 16 MiB, keyed by
+account and URL. Requests are deduplicated, size-limited, and retried after five
+minutes on failure. Avatar redirects must never forward Jira credentials to
+another origin. Demo mode shows placeholders without fetching or reading caches.
+
 Config is `%APPDATA%/not-bad-jira/config.yaml`, cache is
 `%LOCALAPPDATA%/not-bad-jira/cache/issues.json` (8 MiB cap, versioned and bound
 to account and tab queries). Tokens belong only in Windows Credential Manager,
@@ -97,7 +106,7 @@ window handle. Never send test input to other apps.
 Pass `-TargetProcessId` to native smoke and capture scripts so a closed preview
 cannot redirect a check to another app window.
 
-Validation on 2026-11-13: 21 tests pass; Clippy passes with `-D warnings`.
+Validation on 2026-11-13: 29 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,

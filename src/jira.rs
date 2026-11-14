@@ -56,6 +56,51 @@ impl Client {
         .body_mut()
         .read_json()?)
     }
+
+    pub fn avatar_bytes(&self, address: &str) -> Result<Vec<u8>> {
+        let site = url::Url::parse(&self.config.jira.base_url)?;
+        let mut address = url::Url::parse(address)?;
+        // Resolve redirects explicitly: a Jira avatar can redirect to a public
+        // CDN, but the account's Authorization header must never follow it.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(std::time::Duration::from_secs(8)))
+            .build()
+            .into();
+        for _ in 0..5 {
+            let local_fixture = cfg!(test) && address.host_str() == Some("127.0.0.1");
+            if (address.scheme() != "https" && !local_fixture)
+                || !address.username().is_empty()
+                || address.password().is_some()
+            {
+                bail!("Unsupported avatar address");
+            }
+            let mut request = agent.get(address.as_str()).header("Accept", "image/*");
+            if address.origin() == site.origin() {
+                request = request.header("Authorization", &self.auth);
+            }
+            let mut response = request.call()?;
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get("Location")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("Avatar redirect has no location"))?;
+                address = address.join(location)?;
+                continue;
+            }
+            if !response.status().is_success() {
+                bail!("Avatar unavailable");
+            }
+            return Ok(response
+                .body_mut()
+                .with_config()
+                .limit(1024 * 1024)
+                .read_to_vec()?);
+        }
+        bail!("Too many avatar redirects")
+    }
     pub fn send(&self, method: &str, path: &str, body: Value) -> Result<Value> {
         let mut r = match method {
             "PUT" => self
@@ -251,5 +296,76 @@ mod tests {
                 .contains("401")
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn avatar_redirects_never_forward_jira_credentials_to_another_origin() {
+        fn endpoint(
+            location: Option<String>,
+            body: &'static [u8],
+        ) -> (String, thread::JoinHandle<bool>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut authorization = false;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    authorization |= line.to_ascii_lowercase().starts_with("authorization:");
+                }
+                if let Some(location) = location {
+                    write!(socket, "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                    socket.write_all(body).unwrap();
+                }
+                authorization
+            });
+            (address, server)
+        }
+        let (cdn, public) = endpoint(None, b"image-bytes");
+        let (site, jira) = endpoint(Some(format!("{cdn}/photo.png")), b"");
+        let client = Client::new(
+            Config::initial(site.clone(), "test@example.com".into(), "T".into()),
+            "fixture-token".into(),
+        );
+        assert_eq!(
+            client.avatar_bytes(&format!("{site}/avatar")).unwrap(),
+            b"image-bytes"
+        );
+        assert!(jira.join().unwrap());
+        assert!(!public.join().unwrap());
+    }
+
+    #[test]
+    fn avatar_downloader_rejects_insecure_and_embedded_credential_urls() {
+        let client = Client::new(
+            Config::initial(
+                "https://jira.example".into(),
+                "test@example.com".into(),
+                "T".into(),
+            ),
+            "fixture-token".into(),
+        );
+        for address in [
+            "http://avatar.example/photo.png",
+            "https://name:password@avatar.example/photo.png",
+            "file:///avatar.png",
+        ] {
+            assert_eq!(
+                client.avatar_bytes(address).unwrap_err().to_string(),
+                "Unsupported avatar address"
+            );
+        }
     }
 }

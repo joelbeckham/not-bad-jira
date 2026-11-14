@@ -39,6 +39,7 @@ impl Sender {
     }
 }
 pub struct AppView {
+    avatars: crate::avatar::AvatarCache,
     focus: FocusHandle,
     config: Option<Config>,
     client: Option<Client>,
@@ -103,6 +104,7 @@ impl AppView {
         let summary_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue summary"));
         let picker_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         let mut this = Self {
+            avatars: Default::default(),
             focus: cx.focus_handle(),
             config,
             client: None,
@@ -303,7 +305,7 @@ impl AppView {
         }
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
+        let mut changed = self.avatars.poll();
         while let Ok((epoch, message)) = self.rx.try_recv() {
             if epoch != u64::MAX && epoch != self.tx.epoch {
                 continue;
@@ -982,6 +984,8 @@ impl AppView {
             .as_ref()
             .is_some_and(|p| p.kind == kind && p.key == issue.key);
         div()
+            .min_w_0()
+            .max_w_full()
             .on_children_prepainted(move |children, _, _| {
                 if let Some(rect) = children.first() {
                     bounds.borrow_mut().insert(bounds_key.clone(), *rect);
@@ -992,6 +996,8 @@ impl AppView {
                     .ghost()
                     .small()
                     .h(px(24.))
+                    .min_w_0()
+                    .max_w_full()
                     .px_1()
                     .disabled(self.saving)
                     .when(open, |button| button.bg(rgb(0x242d3a)))
@@ -1014,20 +1020,94 @@ impl AppView {
             .into_any_element()
     }
 
+    fn person(
+        &self,
+        user: &Value,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let unassigned = user.is_null()
+            || name.is_empty()
+            || name == "—"
+            || (user["accountId"].as_str().is_none() && name.eq_ignore_ascii_case("unassigned"));
+        let image = if unassigned {
+            None
+        } else {
+            self.avatars
+                .get(
+                    self.config.as_ref().filter(|_| !self.demo),
+                    self.client.as_ref(),
+                    user,
+                )
+                .and_then(|image| image.use_render_image(window, cx))
+        };
+        let loaded = image.is_some();
+        let avatar = if let Some(image) = image {
+            img(image).size_full().rounded_full().into_any_element()
+        } else {
+            gpui_kit::component::Icon::new(if unassigned {
+                gpui_kit::assets::IconName::CircleDashed
+            } else {
+                gpui_kit::assets::IconName::CircleUserRound
+            })
+            .size(px(16.))
+            .text_color(rgb(0x929cad))
+            .into_any_element()
+        };
+        div()
+            .h(px(20.))
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .text_color(rgb(if unassigned { 0x929cad } else { 0xa4afc0 }))
+            .child(
+                div()
+                    .size(px(16.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .overflow_hidden()
+                    .when(loaded, |avatar| {
+                        avatar.border_1().border_color(rgb(0x414b5b))
+                    })
+                    .child(avatar),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(if unassigned {
+                        "Unassigned".to_string()
+                    } else {
+                        name
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_choice_row(
         &self,
         visible_index: usize,
         request: u64,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let picker = self.picker.as_ref().unwrap();
         let choice = picker.choices[picker.visible[visible_index]].clone();
         let selected = visible_index == picker.selected;
         let current = picker.is_current(&choice);
-        let has_icons = matches!(picker.kind.as_str(), "priority" | "status" | "done");
+        let has_icons = matches!(
+            picker.kind.as_str(),
+            "priority" | "status" | "done" | "assignee"
+        );
         let content = match picker.kind.as_str() {
             "priority" => crate::priority::detail(choice.label.clone()).into_any_element(),
             "status" | "done" => crate::status::detail(&choice.value).into_any_element(),
+            "assignee" => self.person(&choice.value, choice.label.clone(), window, cx),
             _ => div()
                 .overflow_hidden()
                 .whitespace_nowrap()
@@ -1145,11 +1225,11 @@ impl AppView {
                     cx.processor(
                         move |this: &mut Self,
                               range: std::ops::Range<usize>,
-                              _: &mut Window,
+                              window: &mut Window,
                               cx: &mut Context<Self>| {
                             range
                                 .map(|visible_index| {
-                                    this.render_choice_row(visible_index, request, cx)
+                                    this.render_choice_row(visible_index, request, window, cx)
                                 })
                                 .collect()
                         },
@@ -1389,7 +1469,13 @@ impl AppView {
             }
             "i" => {
                 if let (Some(key), Some(user)) = (self.current(cx), self.current_user.clone()) {
-                    self.mutate(key.clone(),"PUT",format!("issue/{key}/assignee"),json!({"accountId":user["accountId"]}),Some(json!({"assignee":{"accountId":user["accountId"],"displayName":user["displayName"]}})));
+                    self.mutate(
+                        key.clone(),
+                        "PUT",
+                        format!("issue/{key}/assignee"),
+                        json!({"accountId":user["accountId"]}),
+                        Some(json!({"assignee":user})),
+                    );
                 } else {
                     self.status = "Connect your account to assign issues".into();
                 }
@@ -1690,21 +1776,17 @@ impl Render for AppView {
                                                 cx,
                                             ),
                                         )
-                                        .child(
-                                            self.field_trigger(
-                                                "assignee",
-                                                &issue,
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .text_color(rgb(0xa4afc0))
-                                                    .child(muted("Assignee"))
-                                                    .child(issue.field("assignee"))
-                                                    .into_any_element(),
+                                        .child(self.field_trigger(
+                                            "assignee",
+                                            &issue,
+                                            self.person(
+                                                &issue.fields["assignee"],
+                                                issue.field("assignee"),
+                                                window,
                                                 cx,
                                             ),
-                                        ),
+                                            cx,
+                                        )),
                                 ),
                         )
                         .child(div().text_size(px(15.)).child(
@@ -1826,7 +1908,7 @@ impl Render for AppView {
                             cx.processor(
                                 move |this: &mut Self,
                                       range: std::ops::Range<usize>,
-                                      _: &mut Window,
+                                      window: &mut Window,
                                       cx: &mut Context<Self>| {
                                     range
                                         .map(|i| {
@@ -1884,20 +1966,17 @@ impl Render for AppView {
                                                             .flex()
                                                             .items_center()
                                                             .overflow_hidden()
-                                                            .child(
-                                                                this.field_trigger(
-                                                                    field,
-                                                                    issue,
-                                                                    div()
-                                                                        .text_color(rgb(0xa4afc0))
-                                                                        .overflow_hidden()
-                                                                        .whitespace_nowrap()
-                                                                        .text_ellipsis()
-                                                                        .child(issue.field(field))
-                                                                        .into_any_element(),
+                                                            .child(this.field_trigger(
+                                                                field,
+                                                                issue,
+                                                                this.person(
+                                                                    &issue.fields[field],
+                                                                    issue.field(field),
+                                                                    window,
                                                                     cx,
                                                                 ),
-                                                            )
+                                                                cx,
+                                                            ))
                                                             .into_any_element();
                                                     }
                                                     let value = if field == "key" {
