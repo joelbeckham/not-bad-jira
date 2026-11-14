@@ -83,6 +83,16 @@ impl AvatarCache {
     ) -> Option<Arc<Image>> {
         let account = account?;
         let address = avatar_url(user)?;
+        self.get_resource(Some(account), client, address)
+    }
+
+    pub fn get_resource(
+        &self,
+        account: Option<&crate::config::Config>,
+        client: Option<&Client>,
+        address: &str,
+    ) -> Option<Arc<Image>> {
+        let account = account?;
         let key = key(account, address);
         let now = Instant::now();
         let mut entries = self.entries.borrow_mut();
@@ -221,6 +231,15 @@ fn load_or_enqueue(
 }
 
 fn normalize(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'<')
+    {
+        return normalize_svg(bytes);
+    }
     let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(1024);
@@ -233,6 +252,26 @@ fn normalize(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut png = Cursor::new(Vec::new());
     image.write_to(&mut png, image::ImageFormat::Png)?;
     Ok(png.into_inner())
+}
+
+fn normalize_svg(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut options = resvg::usvg::Options::default();
+    // Issue icons must not read local files or follow embedded external URLs.
+    options.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    let tree = resvg::usvg::Tree::from_data(bytes, &options)?;
+    let size = tree.size();
+    let scale = 48. / size.width().max(size.height());
+    let transform = resvg::tiny_skia::Transform::from_translate(
+        (48. - size.width() * scale) / 2.,
+        (48. - size.height() * scale) / 2.,
+    )
+    .pre_scale(scale, scale);
+    let mut pixels = resvg::tiny_skia::Pixmap::new(48, 48).unwrap();
+    resvg::render(&tree, transform, &mut pixels.as_mut());
+    if !pixels.pixels().iter().any(|pixel| pixel.alpha() != 0) {
+        anyhow::bail!("Empty icon");
+    }
+    Ok(pixels.encode_png()?)
 }
 
 fn load(root: &Path, key: &str) -> Option<(Vec<u8>, Duration)> {
@@ -420,6 +459,28 @@ mod tests {
             .write_to(&mut large, image::ImageFormat::Png)
             .unwrap();
         assert!(normalize(&large.into_inner()).is_err());
+    }
+
+    #[test]
+    fn svg_icons_preserve_transparency_and_aspect_ratio() {
+        let svg = b"\xef\xbb\xbf<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><rect width='32' height='16' fill='#83d4ac'/></svg>";
+        let png = normalize(svg).unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (48, 48));
+        assert_eq!(image.get_pixel(24, 2).0[3], 0);
+        assert_eq!(image.get_pixel(24, 24).0, [0x83, 0xd4, 0xac, 255]);
+    }
+
+    #[test]
+    fn svg_icons_cannot_load_external_files() {
+        let directory = Directory::new();
+        let local = directory.0.join("private.png");
+        std::fs::write(&local, png()).unwrap();
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><image href='{}' width='16' height='16'/></svg>",
+            local.to_string_lossy().replace('\\', "/")
+        );
+        assert!(normalize(svg.as_bytes()).is_err());
     }
 
     #[test]

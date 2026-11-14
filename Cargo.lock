@@ -3902,6 +3902,7 @@ dependencies = [
  "image",
  "keyring",
  "pulldown-cmark",
+ "resvg 0.46.0",
  "serde",
  "serde_json",
  "serde_norway",

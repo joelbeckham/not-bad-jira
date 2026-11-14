@@ -84,6 +84,11 @@ account and URL. Requests are deduplicated, size-limited, and retried after five
 minutes on failure. Avatar redirects must never forward Jira credentials to
 another origin. Demo mode shows placeholders without fetching or reading caches.
 
+Issue type icons use Jira's `issuetype.iconUrl` through the same image cache,
+including SVGs rasterized on a worker with external image references disabled.
+`src/issue_type.rs` supplies themed fallbacks. Show the icon beside issue keys;
+an explicit type column takes its place in list tabs that already include one.
+
 Config is `%APPDATA%/not-bad-jira/config.yaml`, cache is
 `%LOCALAPPDATA%/not-bad-jira/cache/issues.json` (8 MiB cap, versioned and bound
 to account and tab queries). Tokens belong only in Windows Credential Manager,
@@ -106,7 +111,7 @@ window handle. Never send test input to other apps.
 Pass `-TargetProcessId` to native smoke and capture scripts so a closed preview
 cannot redirect a check to another app window.
 
-Validation on 2026-11-13: 29 tests pass; Clippy passes with `-D warnings`.
+Validation on 2026-11-13: 31 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,

@@ -11,7 +11,13 @@ gpui_kit::assets::icon_assets!(
         Equal,
         CircleDashed,
         CircleDot,
-        CircleUserRound
+        CircleUserRound,
+        Bug,
+        Bookmark,
+        SquareCheck,
+        Zap,
+        Copy,
+        Diamond
     ]
 );
 

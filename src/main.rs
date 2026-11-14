@@ -7,6 +7,7 @@ mod app;
 mod avatar;
 mod config;
 mod indicator;
+mod issue_type;
 mod jira;
 mod picker;
 mod priority;

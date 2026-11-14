@@ -518,7 +518,7 @@ impl AppView {
                         if field == "key" {
                             i.key.clone()
                         } else {
-                            i.field(field)
+                            i.field(if field == "type" { "issuetype" } else { field })
                         }
                     })
                     .unwrap_or_default()
@@ -1020,6 +1020,66 @@ impl AppView {
             .into_any_element()
     }
 
+    fn type_icon(
+        &self,
+        kind: &Value,
+        id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let image = kind["iconUrl"]
+            .as_str()
+            .filter(|address| !address.is_empty())
+            .and_then(|address| {
+                self.avatars.get_resource(
+                    self.config.as_ref().filter(|_| !self.demo),
+                    self.client.as_ref(),
+                    address,
+                )
+            })
+            .and_then(|image| image.use_render_image(window, cx));
+        crate::issue_type::icon(kind, image, id)
+    }
+
+    fn issue_key(
+        &self,
+        issue: &Issue,
+        show_type: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .h(px(20.))
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .when(show_type, |row| {
+                row.child(self.type_icon(
+                    &issue.fields["issuetype"],
+                    SharedString::from(format!("key-type-{}", issue.key)),
+                    window,
+                    cx,
+                ))
+            })
+            .child(
+                div()
+                    .id(SharedString::from(format!("key-label-{}", issue.key)))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .font_family("JetBrains Mono")
+                    .text_color(rgb(0x91b9f7))
+                    .tooltip({
+                        let key = issue.key.clone();
+                        move |window, cx| Tooltip::new(key.clone()).build(window, cx)
+                    })
+                    .child(issue.key.clone()),
+            )
+            .into_any_element()
+    }
+
     fn person(
         &self,
         user: &Value,
@@ -1102,12 +1162,19 @@ impl AppView {
         let current = picker.is_current(&choice);
         let has_icons = matches!(
             picker.kind.as_str(),
-            "priority" | "status" | "done" | "assignee"
+            "priority" | "status" | "done" | "assignee" | "create"
         );
         let content = match picker.kind.as_str() {
             "priority" => crate::priority::detail(choice.label.clone()).into_any_element(),
             "status" | "done" => crate::status::detail(&choice.value).into_any_element(),
             "assignee" => self.person(&choice.value, choice.label.clone(), window, cx),
+            "create" => div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(self.type_icon(&choice.value, ("choice-type", visible_index), window, cx))
+                .child(choice.label.clone())
+                .into_any_element(),
             _ => div()
                 .overflow_hidden()
                 .whitespace_nowrap()
@@ -1269,7 +1336,7 @@ impl AppView {
             "demo@example.com".into(),
             "NBJ".into(),
         ));
-        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("NBJ-105","Review empty states","To Do","Lowest","Unassigned")].iter().map(|(key,summary,status,priority,assignee)|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":null})}).collect();
+        let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("PLATFORM-12345","Review empty states","To Do","Lowest","Unassigned")].iter().enumerate().map(|(i,(key,summary,status,priority,assignee))|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"issuetype":{"name":(["Task","Story","Bug","Epic","Sub-task"][i]),"subtask":i==4},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.status = "Demo workspace · sample data".into();
     }
@@ -1588,7 +1655,7 @@ fn fuzzy(query: &str, text: &str) -> bool {
         .all(|q| chars.by_ref().any(|c| c == q))
 }
 fn cell(text: String, field: &str) -> Div {
-    if field == "status" || field == "priority" {
+    if matches!(field, "status" | "priority" | "type" | "issuetype") {
         div()
             .w(px(64.))
             .pr_3()
@@ -1610,7 +1677,7 @@ fn cell(text: String, field: &str) -> Div {
         column(
             text,
             match field {
-                "key" => 120.,
+                "key" => 148.,
                 "assignee" | "reporter" => 160.,
                 _ => 130.,
             },
@@ -1723,12 +1790,9 @@ impl Render for AppView {
                                                 .flex()
                                                 .items_center()
                                                 .gap_3()
-                                                .child(
-                                                    muted(issue.key.clone())
-                                                        .font_family("JetBrains Mono")
-                                                        .text_color(rgb(0x91b9f7))
-                                                        .flex_shrink_0(),
-                                                )
+                                                .child(div().flex_shrink_0().child(
+                                                    self.issue_key(&issue, true, window, cx),
+                                                ))
                                                 .child(
                                                     div()
                                                         .id("detail-title")
@@ -1932,6 +1996,43 @@ impl Render for AppView {
                                                 .bg(rgb(if selected { 0x253348 } else { 0x191c23 }))
                                                 .cursor_pointer()
                                                 .children(columns.iter().map(|field| {
+                                                    if field == "key" {
+                                                        let show_type =
+                                                            !columns.iter().any(|field| {
+                                                                matches!(
+                                                                    field.as_str(),
+                                                                    "type" | "issuetype"
+                                                                )
+                                                            });
+                                                        return div()
+                                                            .w(px(148.))
+                                                            .pr_3()
+                                                            .flex_shrink_0()
+                                                            .min_w_0()
+                                                            .child(this.issue_key(
+                                                                issue, show_type, window, cx,
+                                                            ))
+                                                            .into_any_element();
+                                                    }
+                                                    if field == "type" || field == "issuetype" {
+                                                        return div()
+                                                            .w(px(64.))
+                                                            .pr_3()
+                                                            .flex_shrink_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(this.type_icon(
+                                                                &issue.fields["issuetype"],
+                                                                SharedString::from(format!(
+                                                                    "column-type-{}",
+                                                                    issue.key
+                                                                )),
+                                                                window,
+                                                                cx,
+                                                            ))
+                                                            .into_any_element();
+                                                    }
                                                     if field == "status" || field == "priority" {
                                                         let icon = if field == "status" {
                                                             crate::status::icon(
