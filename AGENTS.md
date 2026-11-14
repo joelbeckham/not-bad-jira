@@ -33,6 +33,8 @@ Apply this rule to all future UI changes, on every screen:
   for demo and test modes.
 - Prefer removing unnecessary copy to replacing it with different filler.
 - Do not repeat field labels in placeholders or explain standard OS navigation.
+- Keep shortcut hints in the footer; do not repeat them inside action-button
+  labels when the footer already shows the same binding.
 
 ## Application
 

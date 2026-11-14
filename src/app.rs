@@ -3102,7 +3102,7 @@ impl Render for AppView {
                                 .label(if self.saving {
                                     "Saving…"
                                 } else {
-                                    "Save changes   Ctrl+Enter"
+                                    "Save changes"
                                 })
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.save_edit(window, cx);
@@ -3112,7 +3112,7 @@ impl Render for AppView {
                         .child(
                             Button::new("cancel-edit")
                                 .small()
-                                .label("Cancel   Esc")
+                                .label("Cancel")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.edit = None;
                                     this.focus.focus(window, cx);
