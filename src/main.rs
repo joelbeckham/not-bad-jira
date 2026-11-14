@@ -11,6 +11,7 @@ mod issue_type;
 mod jira;
 mod picker;
 mod priority;
+mod related;
 mod status;
 mod store;
 fn main() {

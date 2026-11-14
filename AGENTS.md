@@ -89,6 +89,19 @@ including SVGs rasterized on a worker with external image references disabled.
 `src/issue_type.rs` supplies themed fallbacks. Show the icon beside issue keys;
 an explicit type column takes its place in list tabs that already include one.
 
+`src/related.rs` groups parent, direct children, subtasks and directional issue
+links. Preserve Jira's inward/outward labels, including custom link types.
+Related rows reuse the list's type, status, priority and assignee indicators;
+keep keys readable and summaries on one line. Groups use virtual lists with a
+visible scrollbar when they overflow. Click opens a detail; Tab focuses a group,
+arrows/J/K/Home/End navigate and Enter opens. On a detail, Enter or `/` starts
+inline related filtering. Keep the filter focused while Up/Down move through
+visible rows across groups; J/K remain text input. Enter opens the selection.
+Esc cancels filtering and restores the detail's prior scroll; another Esc goes
+back. Size key columns from all related rows so filtering does not shift them.
+Related metadata loads on a worker, paginates and is cached without replacing
+descriptions/comments. Keep account, request and edit-revision response guards.
+
 Config is `%APPDATA%/not-bad-jira/config.yaml`, cache is
 `%LOCALAPPDATA%/not-bad-jira/cache/issues.json` (8 MiB cap, versioned and bound
 to account and tab queries). Tokens belong only in Windows Credential Manager,
@@ -111,14 +124,23 @@ window handle. Never send test input to other apps.
 Pass `-TargetProcessId` to native smoke and capture scripts so a closed preview
 cannot redirect a check to another app window.
 
-Validation on 2026-11-13: 31 tests pass; Clippy passes with `-D warnings`.
+Validation on 2026-11-13: 38 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,
 Enter selection, mouse selection, Escape, no matches, current-value preservation
 and scrolling to a current value beyond the first eight options.
-Claude's final visual recheck reports the UI ready for user testing. Authenticated
-Jira operations still need validation against an account/project; local HTTP
+Related issue checks cover directional/custom labels, parent/subtask/epic
+grouping, mouse and keyboard drill-in, End scrolling in large groups and Esc
+return navigation. Read-only authenticated checks loaded two custom-direction
+links and five direct children of an epic successfully.
+Inline navigation checks cover Enter activation, live text filtering, retained
+input focus after arrows, selection across groups, safe empty results, scrolling
+large groups and separate Esc cancel/back behavior.
+Claude reviewed inline related navigation; its substantive findings were applied
+and checked natively. The final follow-up review was attempted but failed because
+organizational Claude Code subscription access was disabled. Authenticated
+Jira writes still need validation against an account/project; local HTTP
 fixtures cover search token pagination, 204 updates and authentication errors.
 
 Release measurement (2026-11-13): 19,018,752 bytes (18.1 MiB). The release

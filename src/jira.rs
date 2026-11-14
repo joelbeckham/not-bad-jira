@@ -140,10 +140,18 @@ impl Client {
             }
             format!("filter = {}", t.filter_id)
         };
+        self.search_jql(&jql)
+    }
+
+    pub fn related(&self, issue: &Issue) -> Result<Vec<Issue>> {
+        self.search_jql(&crate::related::query(issue)?)
+    }
+
+    fn search_jql(&self, jql: &str) -> Result<Vec<Issue>> {
         let mut issues = Vec::new();
         let mut token = Value::Null;
         loop {
-            let mut body = json!({"jql":jql,"maxResults":100,"fields":["summary","status","priority","assignee","reporter","issuetype","project","created","updated","duedate"]});
+            let mut body = json!({"jql":jql,"maxResults":100,"fields":["summary","status","priority","assignee","reporter","issuetype","project","created","updated","duedate","parent"]});
             if !token.is_null() {
                 body["nextPageToken"] = token;
             }
@@ -280,6 +288,48 @@ mod tests {
                 .is_null()
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn related_search_paginates_and_requests_parent_and_row_metadata() {
+        let (url, server) = mock(vec![
+            (
+                200,
+                json!({"issues":[{"key":"P-2","fields":{"parent":{"key":"P-1"},"summary":"Child"}}],"nextPageToken":"more","isLast":false}),
+            ),
+            (
+                200,
+                json!({"issues":[{"key":"P-9","fields":{"summary":"Parent"}}],"isLast":true}),
+            ),
+        ]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "P".into()),
+            "fixture-token".into(),
+        );
+        let issues = client
+            .related(&Issue {
+                key: "P-1".into(),
+                fields: json!({"parent":{"key":"P-9"}}),
+            })
+            .unwrap();
+        assert_eq!(issues.len(), 2);
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests[0]["body"]["jql"],
+            "parent = \"P-1\" OR key IN (\"P-9\") ORDER BY key ASC"
+        );
+        let fields = requests[0]["body"]["fields"].as_array().unwrap();
+        for field in [
+            "parent",
+            "summary",
+            "status",
+            "priority",
+            "assignee",
+            "issuetype",
+        ] {
+            assert!(fields.iter().any(|value| value == field));
+        }
+        assert_eq!(requests[1]["body"]["nextPageToken"], "more");
     }
     #[test]
     fn failed_auth_is_an_error() {

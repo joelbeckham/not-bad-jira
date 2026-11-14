@@ -5,6 +5,7 @@ use crate::{
     store::Store,
 };
 use gpui_kit::base::Disableable;
+use gpui_kit::base::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{
     Sizable, TitleBar,
     button::Button,
@@ -20,6 +21,13 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc, time::Duratio
 
 type FieldBounds = Rc<RefCell<HashMap<(String, String), Bounds<Pixels>>>>;
 
+struct RelatedView {
+    focus: FocusHandle,
+    scroll: UniformListScrollHandle,
+    selected: usize,
+    anchor: ScrollAnchor,
+}
+
 enum Message {
     ConfigChanged(Result<Config, String>),
     Connected(Result<(Client, Value), String>),
@@ -27,6 +35,7 @@ enum Message {
     Detail(u64, Result<Issue, String>),
     Saved(String, Option<Issue>, Result<Value, String>),
     Choices(u64, Result<Vec<Choice>, String>),
+    Related(u64, String, u64, Result<Vec<Issue>, String>),
 }
 #[derive(Clone)]
 struct Sender {
@@ -69,6 +78,15 @@ pub struct AppView {
     sort: std::collections::HashMap<usize, (String, u8)>,
     list_scroll: UniformListScrollHandle,
     detail_scroll: ScrollHandle,
+    detail_offsets: HashMap<String, Point<Pixels>>,
+    related_views: RefCell<HashMap<(String, String), RelatedView>>,
+    related_pending: HashMap<String, u64>,
+    related_errors: HashMap<String, String>,
+    related_request: u64,
+    related_navigation: Option<crate::related::Navigation>,
+    related_input: Entity<InputState>,
+    related_origin: Point<Pixels>,
+    related_reveal: bool,
     pending_config: Option<Config>,
     last_refresh: std::time::Instant,
     cache_writer: mpsc::Sender<(Store, Config)>,
@@ -103,6 +121,8 @@ impl AppView {
         let editor = cx.new(|cx| zorite_editor::EditorState::new(window, cx));
         let summary_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue summary"));
         let picker_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
+        let related_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter related issues"));
         let mut this = Self {
             avatars: Default::default(),
             focus: cx.focus_handle(),
@@ -131,6 +151,15 @@ impl AppView {
             sort: Default::default(),
             list_scroll: UniformListScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
+            detail_offsets: Default::default(),
+            related_views: Default::default(),
+            related_pending: Default::default(),
+            related_errors: Default::default(),
+            related_request: 0,
+            related_navigation: None,
+            related_input,
+            related_origin: point(px(0.), px(0.)),
+            related_reveal: false,
             pending_config: None,
             last_refresh: std::time::Instant::now(),
             cache_writer: crate::store::writer(),
@@ -206,6 +235,19 @@ impl AppView {
                     picker.set_query(this.picker_input.read(cx).value().to_string());
                     this.picker_scroll
                         .scroll_to_item(picker.selected, ScrollStrategy::Nearest);
+                    cx.notify();
+                }
+            },
+        ));
+        this.subscriptions.push(cx.subscribe_in(
+            &this.related_input,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(navigation) = this.related_navigation.as_mut()
+                {
+                    navigation.set_query(this.related_input.read(cx).value().to_string());
+                    this.related_reveal = true;
                     cx.notify();
                 }
             },
@@ -382,6 +424,10 @@ impl AppView {
                     if self.saving {
                         continue;
                     }
+                    for reference in crate::related::references(&issue) {
+                        self.store.merge_issue(reference);
+                    }
+                    self.request_related(&issue);
                     self.store.issues.insert(issue.key.clone(), issue);
                 }
                 Message::Detail(revision, Err(e)) => {
@@ -429,6 +475,37 @@ impl AppView {
                                 self.store.issues.insert(key, old);
                             }
                             self.status = format!("Save failed; changes rolled back: {e}");
+                        }
+                    }
+                }
+                Message::Related(revision, key, request, result) => {
+                    if self.related_pending.get(&key) != Some(&request) {
+                        continue;
+                    }
+                    self.related_pending.remove(&key);
+                    if revision != self.revision || self.saving {
+                        continue;
+                    }
+                    match result {
+                        Ok(issues) => {
+                            self.related_reveal = self.related_navigation.is_some();
+                            let children = issues
+                                .iter()
+                                .filter(|issue| issue.fields["parent"]["key"] == key)
+                                .map(|issue| issue.key.clone())
+                                .collect();
+                            self.store.children.insert(key.clone(), children);
+                            for issue in issues {
+                                self.store.merge_issue(issue);
+                            }
+                            self.related_errors.remove(&key);
+                            if let Some(config) = &self.config {
+                                let _ =
+                                    self.cache_writer.send((self.store.clone(), config.clone()));
+                            }
+                        }
+                        Err(error) => {
+                            self.related_errors.insert(key, error);
                         }
                     }
                 }
@@ -481,6 +558,11 @@ impl AppView {
             self.tab = 0;
             self.selected = 0;
             self.stack.clear();
+            self.detail_offsets.clear();
+            self.related_views.borrow_mut().clear();
+            self.related_navigation = None;
+            self.related_pending.clear();
+            self.related_errors.clear();
             self.connect_existing();
             cx.notify();
         }
@@ -530,6 +612,14 @@ impl AppView {
         keys
     }
     fn open(&mut self, key: String) {
+        if self.related_navigation.take().is_some() {
+            self.detail_scroll.set_offset(self.related_origin);
+        }
+        if let Some(current) = self.stack.last() {
+            self.detail_offsets
+                .insert(current.clone(), self.detail_scroll.offset());
+        }
+        self.detail_scroll.set_offset(point(px(0.), px(0.)));
         self.stack.push(key.clone());
         if let Some(client) = self.client.clone() {
             let tx = self.tx.clone();
@@ -541,6 +631,38 @@ impl AppView {
                 ));
             });
         }
+    }
+    fn back(&mut self) {
+        self.related_navigation = None;
+        if let Some(current) = self.stack.pop() {
+            self.detail_offsets
+                .insert(current, self.detail_scroll.offset());
+        }
+        let offset = self
+            .stack
+            .last()
+            .and_then(|key| self.detail_offsets.get(key))
+            .copied()
+            .unwrap_or(point(px(0.), px(0.)));
+        self.detail_scroll.set_offset(offset);
+    }
+
+    fn request_related(&mut self, issue: &Issue) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.related_request += 1;
+        let request = self.related_request;
+        let key = issue.key.clone();
+        self.related_pending.insert(key.clone(), request);
+        self.related_errors.remove(&key);
+        let issue = issue.clone();
+        let revision = self.revision;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = client.related(&issue).map_err(|error| error.to_string());
+            let _ = tx.send(Message::Related(revision, key, request, result));
+        });
     }
     fn current(&self, cx: &App) -> Option<String> {
         self.stack
@@ -879,6 +1001,9 @@ impl AppView {
     }
 
     fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_none() && self.related_key(event, window, cx) {
+            return;
+        }
         let Some(picker) = self.picker.as_mut() else {
             return;
         };
@@ -932,6 +1057,51 @@ impl AppView {
                     cx,
                 ))
                 .child(self.shortcut_button("picker-close", &["Esc"], "Close", "escape", cx))
+        } else if self.related_navigation.is_some() && self.edit.is_none() {
+            let selectable = self.related_navigation.as_ref().is_some_and(|navigation| {
+                self.store
+                    .issues
+                    .get(&navigation.root)
+                    .is_some_and(|issue| navigation.selected(&self.related_groups(issue)).is_some())
+            });
+            shortcuts
+                .when(selectable, |shortcuts| {
+                    shortcuts
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(self.shortcut_button(
+                                    "related-up",
+                                    &["↑"],
+                                    "",
+                                    "related-up",
+                                    cx,
+                                ))
+                                .child(self.shortcut_button(
+                                    "related-down",
+                                    &["↓"],
+                                    "Move",
+                                    "related-down",
+                                    cx,
+                                )),
+                        )
+                        .child(self.shortcut_button(
+                            "related-open",
+                            &["Enter"],
+                            "Open",
+                            "related-open",
+                            cx,
+                        ))
+                })
+                .child(self.shortcut_button(
+                    "related-cancel",
+                    &["Esc"],
+                    "Cancel",
+                    "related-cancel",
+                    cx,
+                ))
         } else if self.config.is_none() {
             shortcuts
         } else if self.edit.is_some() {
@@ -955,7 +1125,17 @@ impl AppView {
                         .child(self.shortcut_button("footer-up", &["K"], "", "k", cx))
                         .child(muted("Move")),
                 )
-                .child(self.shortcut_button("footer-open", &["Enter"], "Open", "enter", cx))
+                .child(self.shortcut_button(
+                    "footer-open",
+                    &["Enter"],
+                    if self.stack.is_empty() {
+                        "Open"
+                    } else {
+                        "Related"
+                    },
+                    "enter",
+                    cx,
+                ))
                 .child(self.shortcut_button("footer-filter", &["/"], "Filter", "/", cx))
                 .child(self.shortcut_button("footer-refresh", &["R"], "Refresh", "r", cx))
                 .child(self.shortcut_button(
@@ -1017,6 +1197,461 @@ impl AppView {
                         cx.notify();
                     })),
             )
+            .into_any_element()
+    }
+
+    fn all_related_groups(&self, issue: &Issue) -> Vec<crate::related::Group> {
+        crate::related::groups(
+            issue,
+            &self.store.issues,
+            self.store
+                .children
+                .get(&issue.key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+    }
+
+    fn related_groups(&self, issue: &Issue) -> Vec<crate::related::Group> {
+        let groups = self.all_related_groups(issue);
+        if let Some(navigation) = self
+            .related_navigation
+            .as_ref()
+            .filter(|nav| nav.root == issue.key)
+        {
+            navigation.filter(groups)
+        } else {
+            groups
+        }
+    }
+
+    fn start_related_navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.stack.last().cloned() else {
+            return;
+        };
+        self.related_origin = self.detail_scroll.offset();
+        self.related_navigation = Some(crate::related::Navigation::new(root));
+        self.related_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        self.related_reveal = true;
+        cx.notify();
+    }
+
+    fn close_related_navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.related_navigation = None;
+        self.detail_scroll.set_offset(self.related_origin);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn scroll_related_selection(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(navigation) = &self.related_navigation else {
+            return;
+        };
+        let Some(issue) = self.store.issues.get(&navigation.root) else {
+            return;
+        };
+        let groups = self.related_groups(issue);
+        let Some((group_id, key)) = navigation.selected(&groups) else {
+            return;
+        };
+        if let Some(view) = self
+            .related_views
+            .borrow()
+            .get(&(navigation.root.clone(), group_id.clone()))
+        {
+            let index = groups
+                .iter()
+                .find(|group| group.id == group_id)
+                .and_then(|group| group.rows.iter().position(|row| row.key == key))
+                .unwrap_or(0);
+            view.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+            let bounds = view.scroll.0.borrow().base_handle.bounds();
+            let viewport = self.detail_scroll.bounds();
+            if bounds.top() < viewport.top() || bounds.bottom() > viewport.bottom() {
+                view.anchor.scroll_to(window, cx);
+            }
+        }
+    }
+
+    fn move_related(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(issue) = self.stack.last().and_then(|key| self.store.issues.get(key)) else {
+            return;
+        };
+        let groups = self.related_groups(issue);
+        if let Some(navigation) = &mut self.related_navigation {
+            navigation.move_selection(&groups, down);
+        }
+        self.related_reveal = true;
+        self.related_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn open_related_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.related_navigation.as_ref().and_then(|navigation| {
+            let issue = self.store.issues.get(&navigation.root)?;
+            navigation.selected(&self.related_groups(issue))
+        });
+        if let Some((_, key)) = target {
+            self.close_related_navigation(window, cx);
+            self.open(key);
+            cx.notify();
+        }
+    }
+
+    fn related_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.related_navigation.is_none()
+            || self.palette
+            || self.edit.is_some()
+            || event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+        {
+            return false;
+        }
+        if event.keystroke.key != "escape"
+            && !self
+                .related_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => self.close_related_navigation(window, cx),
+            "enter" => self.open_related_selection(window, cx),
+            "up" | "down" => self.move_related(event.keystroke.key == "down", window, cx),
+            _ => return false,
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        true
+    }
+
+    fn render_related(
+        &self,
+        issue: &Issue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let groups = self.all_related_groups(issue);
+        let key_width = groups
+            .iter()
+            .flat_map(|group| &group.rows)
+            .map(|row| row.key.chars().count() as f32 * 9. + 48.)
+            .fold(164., f32::max);
+        let navigation = self
+            .related_navigation
+            .as_ref()
+            .filter(|nav| nav.root == issue.key);
+        let groups = if let Some(navigation) = navigation {
+            navigation.filter(groups)
+        } else {
+            groups
+        };
+        let target = navigation.and_then(|nav| nav.selected(&groups));
+        let empty = groups.is_empty();
+        let error = self.related_errors.get(&issue.key);
+        if empty
+            && error.is_none()
+            && !self.related_pending.contains_key(&issue.key)
+            && navigation.is_none()
+        {
+            return None;
+        }
+        let mut section = div().flex().flex_col().gap_3();
+        for group in groups {
+            section = section.child(self.render_related_group(
+                &issue.key,
+                group,
+                key_width,
+                target.clone(),
+                window,
+                cx,
+            ));
+        }
+        if let Some(error) = error {
+            let issue = issue.clone();
+            section = section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(muted(format!("Could not refresh related issues: {error}")))
+                    .child(
+                        Button::new("retry-related")
+                            .small()
+                            .label("Retry")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.request_related(&issue);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        } else if empty {
+            section = section.child(muted(if self.related_pending.contains_key(&issue.key) {
+                "Loading related issues…"
+            } else if navigation.is_some_and(|nav| !nav.query.trim().is_empty()) {
+                "No matches"
+            } else {
+                "No related issues"
+            }));
+        }
+        Some(section.into_any_element())
+    }
+
+    fn render_related_group(
+        &self,
+        root: &str,
+        group: crate::related::Group,
+        key_width: f32,
+        target: Option<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = (root.to_string(), group.id.clone());
+        let (focus, scroll, selected, anchor) = {
+            let mut views = self.related_views.borrow_mut();
+            let view = views.entry(id.clone()).or_insert_with(|| RelatedView {
+                focus: cx.focus_handle(),
+                scroll: UniformListScrollHandle::new(),
+                selected: 0,
+                anchor: ScrollAnchor::for_handle(self.detail_scroll.clone()),
+            });
+            view.selected = view.selected.min(group.rows.len().saturating_sub(1));
+            (
+                view.focus.clone(),
+                view.scroll.clone(),
+                view.selected,
+                view.anchor.clone(),
+            )
+        };
+        let focused = focus.is_focused(window);
+        let active_group = target
+            .as_ref()
+            .is_some_and(|(group_id, _)| group_id == &group.id);
+        let count = group.rows.len();
+        let keys: Vec<_> = group.rows.iter().map(|row| row.key.clone()).collect();
+        let row_id = id.clone();
+        let title = group.title.clone();
+        let visible_rows = ((window.viewport_size().height / px(32.)).floor() as usize)
+            .saturating_sub(if self.related_navigation.is_some() {
+                11
+            } else {
+                8
+            })
+            .clamp(4, 14);
+        let rows = uniform_list(
+            SharedString::from(format!("related-list-{}-{}", root, group.id)),
+            count,
+            cx.processor(
+                move |this: &mut Self,
+                      range: std::ops::Range<usize>,
+                      window: &mut Window,
+                      cx: &mut Context<Self>| {
+                    range
+                        .map(|index| {
+                            this.render_related_row(
+                                &row_id,
+                                &group.rows[index],
+                                target
+                                    .as_ref()
+                                    .map(|(group_id, key)| {
+                                        group_id == &row_id.1 && key == &group.rows[index].key
+                                    })
+                                    .unwrap_or(focused && selected == index),
+                                key_width,
+                                window,
+                                cx,
+                            )
+                        })
+                        .collect()
+                },
+            ),
+        )
+        .h(px((count.min(visible_rows) * 32) as f32))
+        .track_scroll(&scroll);
+        div()
+            .id(SharedString::from(format!(
+                "related-section-{}-{}",
+                root, id.1
+            )))
+            .flex()
+            .flex_col()
+            .anchor_scroll(Some(anchor))
+            .gap_0()
+            .child(
+                section_heading(&title, count).when(focused || active_group, |heading| {
+                    heading.text_color(rgb(0xe6ebf3))
+                }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "related-group-{}-{}",
+                        id.0, id.1
+                    )))
+                    .relative()
+                    .when(count > visible_rows, |group| {
+                        group.border_y_1().border_color(rgb(0x303744)).pr_3()
+                    })
+                    .track_focus(&focus)
+                    .tab_stop(true)
+                    .key_context("RelatedIssues")
+                    .role(Role::ListBox)
+                    .aria_label(title)
+                    .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if this.stack.last() != Some(&id.0) {
+                            return;
+                        }
+                        let key = event.keystroke.key.as_str();
+                        if !matches!(
+                            key,
+                            "j" | "k" | "down" | "up" | "home" | "end" | "enter" | "escape"
+                        ) {
+                            return;
+                        }
+                        if key == "escape" {
+                            this.focus.focus(window, cx);
+                        } else {
+                            let target = {
+                                let mut views = this.related_views.borrow_mut();
+                                let Some(view) = views.get_mut(&id) else {
+                                    return;
+                                };
+                                view.selected = match key {
+                                    "j" | "down" => {
+                                        (view.selected + 1).min(keys.len().saturating_sub(1))
+                                    }
+                                    "k" | "up" => view.selected.saturating_sub(1),
+                                    "home" => 0,
+                                    "end" => keys.len().saturating_sub(1),
+                                    _ => view.selected,
+                                };
+                                view.scroll
+                                    .scroll_to_item(view.selected, ScrollStrategy::Nearest);
+                                keys.get(view.selected).cloned()
+                            };
+                            if key == "enter"
+                                && let Some(target) = target
+                            {
+                                this.open(target);
+                                this.focus.focus(window, cx);
+                            }
+                        }
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .child(rows)
+                    .when(count > visible_rows, |group| {
+                        group.child(Scrollbar::vertical(&scroll).mode(ScrollbarMode::Always))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_related_row(
+        &self,
+        group: &(String, String),
+        issue: &Issue,
+        selected: bool,
+        key_width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = issue.key.clone();
+        let id = format!("related-{}-{}-{}", group.0, group.1, key);
+        let summary = issue.fields["summary"]
+            .as_str()
+            .unwrap_or("Loading…")
+            .to_string();
+        let mut content = div()
+            .w_full()
+            .min_w_0()
+            .text_size(px(13.))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .w(px(key_width))
+                    .pr_3()
+                    .flex_shrink_0()
+                    .child(self.issue_key(issue, true, window, cx)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-summary")))
+                    .flex_1()
+                    .min_w_0()
+                    .pr_4()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(rgb(0xe6ebf3))
+                    .tooltip({
+                        let summary = summary.clone();
+                        move |window, cx| Tooltip::new(summary.clone()).build(window, cx)
+                    })
+                    .child(summary.clone()),
+            );
+        let mut status = div().w(px(52.)).flex_shrink_0().flex().justify_center();
+        if issue.fields.get("status").is_some() {
+            status = status.child(crate::status::icon(
+                &issue.fields["status"],
+                SharedString::from(format!("{id}-status")),
+            ));
+        }
+        content = content.child(status);
+        let mut assignee = div()
+            .w(px(160.))
+            .pr_3()
+            .min_w_0()
+            .flex_shrink_0()
+            .overflow_hidden();
+        if issue.fields.get("assignee").is_some() {
+            assignee = assignee.child(self.person(
+                &issue.fields["assignee"],
+                issue.field("assignee"),
+                window,
+                cx,
+            ));
+        }
+        content = content.child(assignee);
+        let mut priority = div().w(px(52.)).flex_shrink_0().flex().justify_center();
+        if issue.fields.get("priority").is_some() {
+            priority = priority.child(crate::priority::icon(
+                issue.field("priority"),
+                SharedString::from(format!("{id}-priority")),
+            ));
+        }
+        content = content.child(priority);
+        Button::new(SharedString::from(id))
+            .ghost()
+            .tab_stop(false)
+            .w_full()
+            .h(px(32.))
+            .px_2()
+            .text_size(px(13.))
+            .rounded_none()
+            .bg(rgb(if selected { 0x253348 } else { 0x191c23 }))
+            .border_l_2()
+            .border_color(rgb(if selected { 0x79aaf9 } else { 0x191c23 }))
+            .accessibility_label(format!("Open {key}: {summary}"))
+            .child(content)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open(key.clone());
+                this.focus.focus(window, cx);
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -1328,6 +1963,11 @@ impl AppView {
         self.pending_refresh = false;
         self.store = Store::default();
         self.stack.clear();
+        self.detail_offsets.clear();
+        self.related_views.borrow_mut().clear();
+        self.related_navigation = None;
+        self.related_pending.clear();
+        self.related_errors.clear();
         self.tab = 0;
         self.selected = 0;
         self.demo = true;
@@ -1338,8 +1978,96 @@ impl AppView {
         ));
         let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("PLATFORM-12345","Review empty states","To Do","Lowest","Unassigned")].iter().enumerate().map(|(i,(key,summary,status,priority,assignee))|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"issuetype":{"name":(["Task","Story","Bug","Epic","Sub-task"][i]),"subtask":i==4},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
+        self.demo_related();
         self.status = "Demo workspace · sample data".into();
     }
+    fn demo_related(&mut self) {
+        for (key, summary, kind, status, priority, assignee) in [
+            (
+                "NBJ-106",
+                "Keep keyboard focus inside related groups",
+                "Sub-task",
+                "In Progress",
+                "Medium",
+                "Sam Rivera",
+            ),
+            (
+                "NBJ-107",
+                "Document custom relationship directions without changing their original meaning",
+                "Task",
+                "To Do",
+                "Low",
+                "Alex Morgan",
+            ),
+        ] {
+            self.store.merge_issue(Issue { key: key.into(), fields: json!({"summary":summary,"issuetype":{"name":kind,"subtask":kind=="Sub-task"},"status":{"name":status},"priority":{"name":priority},"assignee":{"displayName":assignee},"description":null}) });
+        }
+        for (index, summary) in [
+            "Define the issue row component",
+            "Wire mouse navigation",
+            "Preserve scroll on Back",
+            "Show directional link groups",
+            "Load child issue metadata",
+            "Cache linked issue previews",
+            "Handle missing linked issues",
+            "Keep large epics responsive",
+            "Verify keyboard navigation",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let key = format!("NBJ-{}", 201 + index);
+            self.store.merge_issue(Issue { key, fields: json!({"summary":summary,"issuetype":{"name":"Task"},"status":{"name":"To Do"},"priority":{"name":"Medium"},"assignee":{"displayName":"Sam Rivera"},"parent":{"key":"NBJ-104"},"description":null}) });
+        }
+        let refs: HashMap<String, Value> = self
+            .store
+            .issues
+            .values()
+            .map(|issue| {
+                let fields = ["summary", "issuetype", "status", "priority", "assignee"]
+                    .into_iter()
+                    .filter_map(|field| {
+                        issue
+                            .fields
+                            .get(field)
+                            .map(|value| (field.to_string(), value.clone()))
+                    })
+                    .collect::<serde_json::Map<String, Value>>();
+                (issue.key.clone(), json!({"key":issue.key,"fields":fields}))
+            })
+            .collect();
+        let root = self.store.issues.get_mut("NBJ-101").unwrap();
+        root.fields["parent"] = refs["NBJ-104"].clone();
+        root.fields["subtasks"] = json!([refs["PLATFORM-12345"], refs["NBJ-106"]]);
+        root.fields["issuelinks"] = json!([
+            {"type":{"inward":"is blocked by","outward":"blocks"},"inwardIssue":refs["NBJ-103"]},
+            {"type":{"inward":"is blocked by","outward":"blocks"},"outwardIssue":refs["NBJ-102"]},
+            {"type":{"inward":"relates to","outward":"relates to"},"outwardIssue":refs["NBJ-107"]}
+        ]);
+        root.fields["comment"] = json!({"comments":[{"author":{"displayName":"Sam Rivera"},"body":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"Navigation check complete."}]}]}}]});
+        for key in ["PLATFORM-12345", "NBJ-106"] {
+            self.store.issues.get_mut(key).unwrap().fields["parent"] = refs["NBJ-101"].clone();
+        }
+        for key in ["NBJ-102", "NBJ-103", "NBJ-107"] {
+            self.store.issues.get_mut(key).unwrap().fields["parent"] = refs["NBJ-104"].clone();
+        }
+        self.store.issues.get_mut("NBJ-102").unwrap().fields["issuelinks"] = json!([
+            {"type":{"inward":"is blocked by","outward":"blocks"},"inwardIssue":refs["NBJ-101"]}
+        ]);
+        self.store.children.insert(
+            "NBJ-101".into(),
+            vec!["PLATFORM-12345".into(), "NBJ-106".into()],
+        );
+        self.store.children.insert(
+            "NBJ-104".into(),
+            ["NBJ-101", "NBJ-102", "NBJ-103", "NBJ-107"]
+                .into_iter()
+                .map(String::from)
+                .chain((201..210).map(|number| format!("NBJ-{number}")))
+                .collect(),
+        );
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.edit.is_some()
             && event.keystroke.modifiers.control
@@ -1402,6 +2130,7 @@ impl AppView {
     }
     fn run_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = false;
+        self.related_navigation = None;
         self.focus.focus(window, cx);
         if self.saving && ["s", "p", "a", "t", "e", "m", "c", "delete", "d", "i"].contains(&command)
         {
@@ -1444,7 +2173,10 @@ impl AppView {
                     cx.notify();
                     return;
                 }
-                "enter" => return,
+                "enter" | "/" => {
+                    self.start_related_navigation(window, cx);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1461,8 +2193,10 @@ impl AppView {
                 }
             }
             "escape" => {
-                if self.stack.pop().is_none() {
+                if self.stack.is_empty() {
                     self.inputs[4].update(cx, |s, cx| s.set_value("", window, cx));
+                } else {
+                    self.back();
                 }
             }
             "r" => self.refresh(),
@@ -1523,6 +2257,11 @@ impl AppView {
                 self.demo = false;
                 self.store = Store::default();
                 self.stack.clear();
+                self.detail_offsets.clear();
+                self.related_views.borrow_mut().clear();
+                self.related_navigation = None;
+                self.related_pending.clear();
+                self.related_errors.clear();
                 self.status.clear();
             }
             "delete" => {
@@ -1685,6 +2424,17 @@ fn cell(text: String, field: &str) -> Div {
         .pr_3()
     }
 }
+fn section_heading(title: &str, count: usize) -> Div {
+    div()
+        .h(px(20.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_size(px(11.))
+        .text_color(rgb(0x929cad))
+        .child(title.to_uppercase())
+        .child(div().text_color(rgb(0x7d8797)).child(count.to_string()))
+}
 fn muted(text: impl Into<SharedString>) -> Div {
     div()
         .text_color(rgb(0x929cad))
@@ -1742,15 +2492,65 @@ impl Render for AppView {
                             this.tab = i;
                             this.selected = 0;
                             this.stack.clear();
+                            this.detail_offsets.clear();
+                            this.related_views.borrow_mut().clear();
+                            this.related_navigation = None;
+                            this.related_pending.clear();
+                            this.related_errors.clear();
                             cx.notify();
                         }))
                 }));
             body = body.child(tabs);
+            if self
+                .related_navigation
+                .as_ref()
+                .is_some_and(|nav| self.stack.last() == Some(&nav.root))
+            {
+                body = body.child(
+                    div()
+                        .id("related-filter")
+                        .px_6()
+                        .py_2()
+                        .flex_shrink_0()
+                        .bg(rgb(0x191c23))
+                        .border_b_1()
+                        .border_color(rgb(0x303744))
+                        .overflow_hidden()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            div().max_w(px(480.)).child(
+                                Input::new(&self.related_input)
+                                    .small()
+                                    .focus_bordered(false)
+                                    .border_color(rgb(0x79aaf9))
+                                    .rounded_sm()
+                                    .aria_label("Filter related issues")
+                                    .prefix(
+                                        gpui_kit::component::Icon::new(
+                                            gpui_kit::assets::IconName::Search,
+                                        )
+                                        .size(px(14.))
+                                        .text_color(rgb(0x929cad)),
+                                    ),
+                            ),
+                        ),
+                );
+            }
             if let Some(key) = self.stack.last() {
                 let issue = self.store.issues.get(key).cloned().unwrap_or_default();
+                let back_label = self
+                    .stack
+                    .iter()
+                    .rev()
+                    .nth(1)
+                    .map(|key| format!("Back to {key} (Esc)"))
+                    .unwrap_or_else(|| "Back to issues (Esc)".into());
                 body = body.child(
                     div()
                         .id("detail")
+                        .flex_1()
+                        .min_h_0()
                         .track_scroll(&self.detail_scroll)
                         .overflow_y_scroll()
                         .px_6()
@@ -1776,10 +2576,11 @@ impl Render for AppView {
                                             Button::new("back")
                                                 .small()
                                                 .icon(gpui_kit::assets::IconName::ArrowLeft)
-                                                .accessibility_label("Back to issues (Esc)")
-                                                .tooltip("Back to issues (Esc)")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.stack.pop();
+                                                .accessibility_label(back_label.clone())
+                                                .tooltip(back_label)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.back();
+                                                    this.focus.focus(window, cx);
                                                     cx.notify();
                                                 })),
                                         )
@@ -1853,71 +2654,49 @@ impl Render for AppView {
                                         )),
                                 ),
                         )
-                        .child(div().text_size(px(15.)).child(
-                            gpui_kit::component::text::TextView::markdown(
-                                "description",
-                                crate::adf::Document::display(&issue.fields["description"]),
-                            ),
-                        ))
-                        .child(muted("COMMENTS"))
                         .children(
-                            issue.fields["subtasks"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .chain(
-                                    std::iter::once(&issue.fields["parent"])
-                                        .filter(|v| !v.is_null()),
-                                )
-                                .chain(
-                                    issue.fields["issuelinks"]
-                                        .as_array()
-                                        .into_iter()
-                                        .flatten()
-                                        .map(|v| {
-                                            if v["outwardIssue"].is_object() {
-                                                &v["outwardIssue"]
-                                            } else {
-                                                &v["inwardIssue"]
-                                            }
-                                        }),
-                                )
-                                .enumerate()
-                                .filter_map(|(i, v)| {
-                                    let key = v["key"].as_str()?.to_string();
-                                    Some(
-                                        Button::new(("related", i))
-                                            .label(format!(
-                                                "{}  {}",
-                                                key,
-                                                v["fields"]["summary"]
-                                                    .as_str()
-                                                    .unwrap_or("Related issue")
-                                            ))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open(key.clone());
-                                                cx.notify();
-                                            })),
-                                    )
-                                }),
+                            (!crate::adf::Document::display(&issue.fields["description"])
+                                .trim()
+                                .is_empty())
+                            .then(|| {
+                                div()
+                                    .text_size(px(15.))
+                                    .when(self.related_navigation.is_some(), |context| {
+                                        context.opacity(0.6)
+                                    })
+                                    .child(gpui_kit::component::text::TextView::markdown(
+                                        "description",
+                                        crate::adf::Document::display(&issue.fields["description"]),
+                                    ))
+                            }),
                         )
+                        .children(self.render_related(&issue, window, cx))
                         .children(
                             issue.fields["comment"]["comments"]
                                 .as_array()
-                                .into_iter()
-                                .flatten()
-                                .map(|v| {
+                                .filter(|comments| !comments.is_empty())
+                                .map(|comments| {
                                     div()
-                                        .py_3()
-                                        .border_b_1()
-                                        .border_color(rgb(0x303744))
-                                        .child(muted(
-                                            v["author"]["displayName"]
-                                                .as_str()
-                                                .unwrap_or("Unknown")
-                                                .to_string(),
-                                        ))
-                                        .child(adf_text(&v["body"]))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .when(self.related_navigation.is_some(), |context| {
+                                            context.opacity(0.6)
+                                        })
+                                        .child(section_heading("Comments", comments.len()))
+                                        .children(comments.iter().map(|v| {
+                                            div()
+                                                .py_2()
+                                                .border_b_1()
+                                                .border_color(rgb(0x303744))
+                                                .child(muted(
+                                                    v["author"]["displayName"]
+                                                        .as_str()
+                                                        .unwrap_or("Unknown")
+                                                        .to_string(),
+                                                ))
+                                                .child(adf_text(&v["body"]))
+                                        }))
                                 }),
                         ),
                 );
@@ -2374,6 +3153,10 @@ impl Render for AppView {
             .as_ref()
             .filter(|p| p.kind != "delete")
             .map(|_| self.render_picker(cx));
+        if self.related_reveal {
+            self.related_reveal = false;
+            self.scroll_related_selection(window, cx);
+        }
         div()
             .id("workspace")
             .relative()
@@ -2392,7 +3175,16 @@ impl Render for AppView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
-                    this.focus.focus(window, cx);
+                    if this.related_navigation.is_some()
+                        && this.edit.is_none()
+                        && !this.palette
+                        && this.picker.is_none()
+                    {
+                        this.related_input
+                            .update(cx, |input, cx| input.focus(window, cx));
+                    } else {
+                        this.focus.focus(window, cx);
+                    }
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| {
@@ -2531,6 +3323,11 @@ impl AppView {
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 match command {
+                    "related-up" | "related-down" => {
+                        this.move_related(command == "related-down", window, cx)
+                    }
+                    "related-open" => this.open_related_selection(window, cx),
+                    "related-cancel" => this.close_related_navigation(window, cx),
                     "picker-up" | "picker-down" => {
                         if let Some(picker) = this.picker.as_mut() {
                             picker.move_selection(command == "picker-down");

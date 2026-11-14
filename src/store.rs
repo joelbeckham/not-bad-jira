@@ -5,6 +5,8 @@ use std::collections::HashMap;
 pub struct Store {
     pub issues: HashMap<String, Issue>,
     pub tabs: Vec<Vec<String>>,
+    #[serde(default)]
+    pub children: HashMap<String, Vec<String>>,
 }
 #[derive(Serialize, Deserialize)]
 struct Cache {
@@ -58,17 +60,21 @@ impl Store {
             .resize_with(self.tabs.len().max(index + 1), Vec::new);
         self.tabs[index] = issues.iter().map(|i| i.key.clone()).collect();
         for issue in issues {
-            if let Some(existing) = self.issues.get_mut(&issue.key) {
-                if let (Some(old), Some(new)) =
-                    (existing.fields.as_object_mut(), issue.fields.as_object())
-                {
-                    for (k, v) in new {
-                        old.insert(k.clone(), v.clone());
-                    }
+            self.merge_issue(issue);
+        }
+    }
+
+    pub fn merge_issue(&mut self, issue: Issue) {
+        if let Some(existing) = self.issues.get_mut(&issue.key) {
+            if let (Some(old), Some(new)) =
+                (existing.fields.as_object_mut(), issue.fields.as_object())
+            {
+                for (k, v) in new {
+                    old.insert(k.clone(), v.clone());
                 }
-            } else {
-                self.issues.insert(issue.key.clone(), issue);
             }
+        } else {
+            self.issues.insert(issue.key.clone(), issue);
         }
     }
 }
@@ -82,6 +88,26 @@ fn signatures(c: &crate::config::Config) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn related_cache_is_additive_and_sparse_previews_preserve_details() {
+        let mut store: Store =
+            serde_json::from_value(serde_json::json!({"issues":{},"tabs":[]})).unwrap();
+        assert!(store.children.is_empty());
+        store.children.insert("P-1".into(), vec!["P-2".into()]);
+        store.merge_issue(Issue { key: "P-2".into(), fields: serde_json::json!({"summary":"Old","description":{"type":"doc"},"comment":{"comments":[{"id":"1"}]}}) });
+        store.merge_issue(Issue {
+            key: "P-2".into(),
+            fields: serde_json::json!({"summary":"New","status":{"name":"Done"}}),
+        });
+        let cached: Store = serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(cached.children["P-1"], ["P-2"]);
+        assert_eq!(cached.issues["P-2"].field("summary"), "New");
+        assert_eq!(cached.issues["P-2"].fields["description"]["type"], "doc");
+        assert_eq!(
+            cached.issues["P-2"].fields["comment"]["comments"][0]["id"],
+            "1"
+        );
+    }
     #[test]
     fn search_refresh_preserves_detail_fields() {
         let mut store = Store::default();
