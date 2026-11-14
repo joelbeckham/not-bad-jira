@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    jira::{Client, Issue},
+    jira::{Client, CreatedIssue, Issue},
     picker::{Choice, Picker},
     store::Store,
 };
@@ -34,6 +34,7 @@ enum Message {
     Tab(usize, u64, Result<Vec<Issue>, String>),
     Detail(u64, Result<Issue, String>),
     Saved(String, Option<Issue>, Result<Value, String>),
+    Created(u64, Result<CreatedIssue, String>),
     Choices(u64, Result<Vec<Choice>, String>),
     Related(u64, String, u64, Result<Vec<Issue>, String>),
 }
@@ -74,6 +75,11 @@ pub struct AppView {
     palette: bool,
     subscriptions: Vec<Subscription>,
     create_summary: String,
+    create_request: u64,
+    create_pending: Option<u64>,
+    create_error: Option<String>,
+    create_refocus: bool,
+    created_detail_error: Option<(String, String)>,
     saving: bool,
     sort: std::collections::HashMap<usize, (String, u8)>,
     list_scroll: UniformListScrollHandle,
@@ -170,6 +176,11 @@ impl AppView {
             connecting: false,
             subscriptions: Vec::new(),
             create_summary: String::new(),
+            create_request: 0,
+            create_pending: None,
+            create_error: None,
+            create_refocus: false,
+            created_detail_error: None,
             saving: false,
         };
         if std::env::args().any(|a| a == "--demo") {
@@ -424,6 +435,13 @@ impl AppView {
                     if self.saving {
                         continue;
                     }
+                    if self
+                        .created_detail_error
+                        .as_ref()
+                        .is_some_and(|(key, _)| key == &issue.key)
+                    {
+                        self.created_detail_error = None;
+                    }
                     for reference in crate::related::references(&issue) {
                         self.store.merge_issue(reference);
                     }
@@ -433,6 +451,45 @@ impl AppView {
                 Message::Detail(revision, Err(e)) => {
                     if revision == self.revision {
                         self.status = format!("Could not load issue: {e}");
+                    }
+                }
+                Message::Created(request, result) => {
+                    if self.create_pending != Some(request) {
+                        continue;
+                    }
+                    self.create_pending = None;
+                    self.saving = false;
+                    self.create_refocus = true;
+                    match result {
+                        Ok(created) => {
+                            let issue = created.issue;
+                            let key = issue.key.clone();
+                            self.created_detail_error =
+                                created.detail_error.map(|error| (key.clone(), error));
+                            for reference in crate::related::references(&issue) {
+                                self.store.merge_issue(reference);
+                            }
+                            self.request_related(&issue);
+                            self.store.issues.insert(key.clone(), issue);
+                            self.edit = None;
+                            self.create_error = None;
+                            self.navigate_to(key.clone());
+                            self.status = format!("Created {key}");
+                            if self.demo {
+                                self.store.tabs[self.tab].insert(0, key);
+                            } else {
+                                self.refresh();
+                                if let Some(config) = &self.config {
+                                    let _ = self
+                                        .cache_writer
+                                        .send((self.store.clone(), config.clone()));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.create_error = Some(error);
+                            self.status.clear();
+                        }
                     }
                 }
                 Message::Saved(key, old, result) => {
@@ -464,13 +521,6 @@ impl AppView {
                             }
                         }
                         Err(e) => {
-                            if key.is_empty() {
-                                self.edit = Some((
-                                    "New issue".into(),
-                                    "create".into(),
-                                    crate::adf::Document::default(),
-                                ));
-                            }
                             if let Some(old) = old {
                                 self.store.issues.insert(key, old);
                             }
@@ -612,6 +662,10 @@ impl AppView {
         keys
     }
     fn open(&mut self, key: String) {
+        self.navigate_to(key.clone());
+        self.load_issue(key);
+    }
+    fn navigate_to(&mut self, key: String) {
         if self.related_navigation.take().is_some() {
             self.detail_scroll.set_offset(self.related_origin);
         }
@@ -620,7 +674,9 @@ impl AppView {
                 .insert(current.clone(), self.detail_scroll.offset());
         }
         self.detail_scroll.set_offset(point(px(0.), px(0.)));
-        self.stack.push(key.clone());
+        self.stack.push(key);
+    }
+    fn load_issue(&self, key: String) {
         if let Some(client) = self.client.clone() {
             let tx = self.tx.clone();
             let revision = self.revision;
@@ -768,17 +824,35 @@ impl AppView {
                 self.status = "Enter an issue summary".into();
                 return;
             }
-            let Some(client) = self.client.clone() else {
+            let client = self.client.clone();
+            if !self.demo && client.is_none() {
                 self.status = "Connect an account to create issues".into();
                 return;
-            };
-            let project = client.config.jira.default_project.clone();
+            }
+            let project = self
+                .config
+                .as_ref()
+                .map(|config| config.jira.default_project.clone())
+                .unwrap_or_default();
             if project.is_empty() {
                 self.status = "Set jira.default_project in your config first".into();
                 return;
             }
             self.create_summary = text.trim().to_string();
+            self.create_error = None;
             self.start_picker("create", String::new(), window, cx);
+            if self.demo {
+                self.picker.as_mut().unwrap().set_choices(Choice::from_jira(
+                    "create",
+                    &json!([
+                        {"id":"task","name":"Task","subtask":false},
+                        {"id":"story","name":"Story","subtask":false},
+                        {"id":"bug","name":"Bug","subtask":false}
+                    ]),
+                ));
+                return;
+            }
+            let client = client.unwrap();
             let request = self.picker_request;
             let tx = self.tx.clone();
             std::thread::spawn(move || {
@@ -788,7 +862,6 @@ impl AppView {
                 })();
                 let _ = tx.send(Message::Choices(request, result.map_err(|e| e.to_string())));
             });
-            self.edit = None;
             return;
         }
         if text.trim().is_empty() && kind != "description" {
@@ -931,7 +1004,16 @@ impl AppView {
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
-        self.focus.focus(window, cx);
+        if self
+            .edit
+            .as_ref()
+            .is_some_and(|(_, kind, _)| kind == "create")
+        {
+            self.summary_input
+                .update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            self.focus.focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -965,8 +1047,7 @@ impl AppView {
             return;
         }
         if kind == "create" {
-            let project = self.config.as_ref().unwrap().jira.default_project.clone();
-            self.mutate(String::new(),"POST","issue".into(),json!({"fields":{"project":{"key":project},"issuetype":{"id":id},"summary":self.create_summary}}),None);
+            self.begin_create(choice.value);
         } else if kind == "delete" {
             self.mutate(
                 key.clone(),
@@ -1000,7 +1081,73 @@ impl AppView {
         cx.notify();
     }
 
+    fn begin_create(&mut self, issue_type: Value) {
+        if self.saving {
+            return;
+        }
+        let client = self.client.clone();
+        if !self.demo && client.is_none() {
+            self.create_error = Some("Connect an account to create issues".into());
+            return;
+        }
+        self.create_request += 1;
+        let request = self.create_request;
+        self.create_pending = Some(request);
+        self.create_error = None;
+        self.saving = true;
+        self.revision += 1;
+        self.status = "Creating issue…".into();
+        let summary = self.create_summary.clone();
+        let demo = self.demo;
+        let next = self
+            .store
+            .issues
+            .keys()
+            .filter_map(|key| key.strip_prefix("NBJ-")?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = if demo {
+                let delay = std::env::args()
+                    .find_map(|arg| {
+                        arg.strip_prefix("--demo-create-delay=")?
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .unwrap_or(1200)
+                    .min(30000);
+                std::thread::sleep(Duration::from_millis(delay));
+                if request == 1 && std::env::args().any(|arg| arg == "--demo-create-error") {
+                    Err("Jira is temporarily unavailable. Try again.".into())
+                } else {
+                    Ok(CreatedIssue {
+                        issue: Issue {
+                            key: format!("NBJ-{next}"),
+                            fields: json!({"summary":summary,"issuetype":issue_type,"status":{"name":"To Do","statusCategory":{"key":"new"}},"priority":{"name":"Medium"},"assignee":null,"description":null,"comment":{"comments":[]}}),
+                        },
+                        detail_error: None,
+                    })
+                }
+            } else {
+                client
+                    .unwrap()
+                    .create_issue(&summary, issue_type)
+                    .map_err(|error| error.to_string())
+            };
+            let _ = tx.send(Message::Created(request, result));
+        });
+    }
+
     fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.create_pending.is_some()
+            && matches!(event.keystroke.key.as_str(), "escape" | "enter")
+        {
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if self.picker.is_none() && self.related_key(event, window, cx) {
             return;
         }
@@ -1023,6 +1170,9 @@ impl AppView {
     }
     fn render_shortcuts(&self, cx: &mut Context<Self>) -> Div {
         let shortcuts = div().flex().items_center().gap_4().flex_shrink_0();
+        if self.create_pending.is_some() {
+            return shortcuts;
+        }
         if self.palette {
             shortcuts
                 .child(self.shortcut_button(
@@ -1209,6 +1359,37 @@ impl AppView {
                 .get(&issue.key)
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
+        )
+    }
+
+    fn render_created_detail_error(
+        &self,
+        issue: &Issue,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (_, error) = self
+            .created_detail_error
+            .as_ref()
+            .filter(|(key, _)| key == &issue.key)?;
+        let key = issue.key.clone();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(div().text_color(rgb(0xf07b84)).child(format!(
+                    "Issue created, but details could not be loaded: {error}"
+                )))
+                .child(
+                    Button::new("retry-created-detail")
+                        .small()
+                        .label("Retry")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.load_issue(key.clone());
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
         )
     }
 
@@ -2069,6 +2250,9 @@ impl AppView {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.create_pending.is_some() {
+            return;
+        }
         if self.edit.is_some()
             && event.keystroke.modifiers.control
             && event.keystroke.key == "enter"
@@ -2291,6 +2475,7 @@ impl AppView {
                 self.status = "Choose the workflow's Done transition".into();
             }
             "c" => {
+                self.create_error = None;
                 self.edit = Some((
                     "New issue".into(),
                     "create".into(),
@@ -2654,6 +2839,7 @@ impl Render for AppView {
                                         )),
                                 ),
                         )
+                        .children(self.render_created_detail_error(&issue, cx))
                         .children(
                             (!crate::adf::Document::display(&issue.fields["description"])
                                 .trim()
@@ -3052,7 +3238,10 @@ impl Render for AppView {
             let single = kind == "summary" || kind == "create";
             let editor_area = if single {
                 div()
-                    .child(Input::new(&self.summary_input))
+                    .child(
+                        Input::new(&self.summary_input)
+                            .disabled(self.saving || self.picker.is_some()),
+                    )
                     .into_any_element()
             } else {
                 div()
@@ -3077,49 +3266,74 @@ impl Render for AppView {
                     .into_any_element()
             };
 
-            body = div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .p_6()
-                .gap_4()
-                .child(muted(format!("{} / Edit {}", key, kind)))
-                .child(editor_area)
-                .children(
-                    (!single && document.markdown.contains("[ADF:"))
-                        .then(|| muted("Leave [ADF:n] markers unchanged.")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(
-                            Button::new("save-edit")
-                                .primary()
-                                .small()
-                                .bg(rgb(0x3776c8))
-                                .text_color(rgb(0xffffff))
-                                .label(if self.saving {
-                                    "Saving…"
-                                } else {
-                                    "Save changes"
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.save_edit(window, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("cancel-edit")
-                                .small()
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.edit = None;
-                                    this.focus.focus(window, cx);
-                                    cx.notify();
-                                })),
-                        ),
-                );
+            body =
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .p_6()
+                    .gap_4()
+                    .child(muted(if kind == "create" {
+                        "New issue".into()
+                    } else {
+                        format!("{key} / Edit {kind}")
+                    }))
+                    .child(editor_area)
+                    .children(self.create_error.as_ref().filter(|_| kind == "create").map(
+                        |error| {
+                            div()
+                                .text_size(px(13.))
+                                .text_color(rgb(0xf07b84))
+                                .child(error.clone())
+                        },
+                    ))
+                    .children(
+                        (!single && document.markdown.contains("[ADF:"))
+                            .then(|| muted("Leave [ADF:n] markers unchanged.")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                Button::new("save-edit")
+                                    .primary()
+                                    .small()
+                                    .bg(rgb(0x3776c8))
+                                    .text_color(rgb(0xffffff))
+                                    .disabled(self.saving || self.picker.is_some())
+                                    .loading(self.create_pending.is_some())
+                                    .when(self.create_pending.is_some(), |button| {
+                                        button.icon(gpui_kit::assets::IconName::Loader)
+                                    })
+                                    .label(if self.create_pending.is_some() {
+                                        "Creating…"
+                                    } else if self.saving {
+                                        "Saving…"
+                                    } else {
+                                        "Save changes"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_edit(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("cancel-edit")
+                                    .small()
+                                    .disabled(self.create_pending.is_some())
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if this.create_pending.is_some() {
+                                            return;
+                                        }
+                                        this.edit = None;
+                                        this.focus.focus(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
         } else if let Some(picker) = &self.picker
             && picker.kind == "delete"
         {
@@ -3148,6 +3362,15 @@ impl Render for AppView {
                 );
         }
         let shortcuts = self.render_shortcuts(cx);
+        if self.create_refocus {
+            self.create_refocus = false;
+            if self.edit.is_some() {
+                self.summary_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+            } else {
+                self.focus.focus(window, cx);
+            }
+        }
         let popup = self
             .picker
             .as_ref()
@@ -3187,9 +3410,9 @@ impl Render for AppView {
                     }
                 }),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.picker.take().is_some() {
-                    cx.notify();
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.picker.is_some() {
+                    this.close_picker(window, cx);
                 }
             }))
             .child(
@@ -3312,6 +3535,9 @@ impl AppView {
             .child(content)
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
+                if this.create_pending.is_some() {
+                    return;
+                }
                 match command {
                     "related-up" | "related-down" => {
                         this.move_related(command == "related-down", window, cx)

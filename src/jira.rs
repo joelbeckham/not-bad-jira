@@ -9,6 +9,10 @@ pub struct Issue {
     #[serde(default)]
     pub fields: Value,
 }
+pub struct CreatedIssue {
+    pub issue: Issue,
+    pub detail_error: Option<String>,
+}
 impl Issue {
     pub fn field(&self, name: &str) -> String {
         let v = &self.fields[name];
@@ -141,6 +145,35 @@ impl Client {
             format!("filter = {}", t.filter_id)
         };
         self.search_jql(&jql)
+    }
+
+    pub fn create_issue(&self, summary: &str, issue_type: Value) -> Result<CreatedIssue> {
+        let data = self.send(
+            "POST",
+            "issue",
+            json!({"fields":{
+                "project":{"key":self.config.jira.default_project},
+                "issuetype":{"id":issue_type["id"]}, "summary":summary
+            }}),
+        )?;
+        let key = data["key"]
+            .as_str()
+            .filter(|key| crate::related::valid_key(key))
+            .ok_or_else(|| anyhow::anyhow!("Jira did not return a valid created issue key"))?;
+        // Once POST succeeds, a failed detail fetch must not offer another POST.
+        Ok(match self.issue(key) {
+            Ok(issue) => CreatedIssue {
+                issue,
+                detail_error: None,
+            },
+            Err(error) => CreatedIssue {
+                issue: Issue {
+                    key: key.into(),
+                    fields: json!({"summary":summary,"issuetype":issue_type}),
+                },
+                detail_error: Some(error.to_string()),
+            },
+        })
     }
 
     pub fn related(&self, issue: &Issue) -> Result<Vec<Issue>> {
@@ -288,6 +321,75 @@ mod tests {
                 .is_null()
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn create_returns_loaded_details_and_sends_the_selected_type() {
+        let (url, server) = mock(vec![
+            (201, json!({"key":"T-3"})),
+            (
+                200,
+                json!({"key":"T-3","fields":{"summary":"New task","status":{"name":"Open"}}}),
+            ),
+        ]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        let created = client
+            .create_issue("New task", json!({"id":"10001","name":"Task"}))
+            .unwrap();
+        assert_eq!(created.issue.key, "T-3");
+        assert_eq!(created.issue.field("status"), "Open");
+        assert!(created.detail_error.is_none());
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["request"], "POST /rest/api/3/issue HTTP/1.1");
+        assert_eq!(
+            requests[0]["body"]["fields"],
+            json!({"project":{"key":"T"},"issuetype":{"id":"10001"},"summary":"New task"})
+        );
+        assert_eq!(requests[1]["request"], "GET /rest/api/3/issue/T-3 HTTP/1.1");
+    }
+
+    #[test]
+    fn create_validation_error_does_not_fetch_details() {
+        let (url, server) = mock(vec![(
+            400,
+            json!({"errors":{"customfield_10000":"Required field"}}),
+        )]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        let error = client
+            .create_issue("Keep this summary", json!({"id":"10001"}))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Required field"));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn detail_failure_after_create_preserves_success_and_never_reposts() {
+        let (url, server) = mock(vec![
+            (201, json!({"key":"T-3"})),
+            (503, json!({"errorMessages":["Unavailable"]})),
+        ]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        let created = client
+            .create_issue("Keep this summary", json!({"id":"10001","name":"Task"}))
+            .unwrap();
+        assert_eq!(created.issue.key, "T-3");
+        assert_eq!(created.issue.field("summary"), "Keep this summary");
+        assert_eq!(created.issue.field("issuetype"), "Task");
+        assert!(created.detail_error.unwrap().contains("503"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]["request"].as_str().unwrap().starts_with("GET "));
     }
 
     #[test]

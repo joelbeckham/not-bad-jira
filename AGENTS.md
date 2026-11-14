@@ -121,6 +121,15 @@ reject missing/duplicated tokens, keep failed drafts, and never replace an
 unrecognized structure with empty text. Existing blocks with unsupported layout
 attributes stay protected. Creating issues can fail when a Jira project requires
 additional custom fields; retain the summary and show Jira's validation error.
+Keep the creation editor visible through issue-type selection and the create
+request. While pending, show the spinner/status, disable summary/submit/cancel,
+and consume duplicate submission/cancel keys. Only navigate to the new issue
+after the create worker returns its details. Preserve the draft and inline error
+on rejection. A failed detail fetch after successful POST must open the confirmed
+issue with a load-only Retry, never repeat the create POST. Creation responses
+carry an account epoch and request ID. Demo creation is memory-only; use
+`--demo-create-delay=12000` and `--demo-create-error` with `--demo` for native
+pending/failure checks (the error flag fails only the first submission).
 
 Native screenshots live under design/reviews. Capture is DPI-aware; Windows'
 invisible resize border may appear around a window. Prefer accessibility actions
@@ -128,8 +137,10 @@ for native smoke tests. Keyboard smoke tests post only to the test app's exact
 window handle. Never send test input to other apps.
 Pass `-TargetProcessId` to native smoke and capture scripts so a closed preview
 cannot redirect a check to another app window.
+Before replacing a running app, preserve open editors/type pickers and pending
+`Saving…` or `Creating…` requests; never discard a user's draft for a rebuild.
 
-Validation on 2026-11-13: 38 tests pass; Clippy passes with `-D warnings`.
+Validation on 2026-11-13: 41 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,
@@ -142,6 +153,11 @@ links and five direct children of an epic successfully.
 Inline navigation checks cover Enter activation, live text filtering, retained
 input focus after arrows, selection across groups, safe empty results, scrolling
 large groups and separate Esc cancel/back behavior.
+Creation checks cover keeping the draft through type selection, disabled pending
+controls, duplicate Enter/Esc protection, direct detail navigation and retry after
+failure. HTTP fixtures cover create payloads, validation rejection and preserving
+confirmed creation when the subsequent detail GET fails. No live Jira issues
+were created by these checks.
 Claude reviewed inline related navigation; its substantive findings were applied
 and checked natively. The final follow-up review was attempted but failed because
 organizational Claude Code subscription access was disabled. Authenticated
@@ -150,6 +166,8 @@ fixtures cover search token pagination, 204 updates and authentication errors.
 Title-bar branding was checked in the native demo and the live window's large
 icon was extracted to verify the taskbar artwork. That Claude review attempt
 was also blocked by the same organizational access error.
+The creation-flow visual review was likewise attempted and blocked; its pending,
+success and failure screenshots were inspected directly.
 
 Release measurement (2026-11-13): 19,018,752 bytes (18.1 MiB). The release
 demo reports 423.88 ms from Rust main to the second-frame callback. This upper
