@@ -39,7 +39,10 @@ Apply this rule to all future UI changes, on every screen:
 Rust 2024, Windows MSVC. GPUI Kit is pinned to 0.9.1 (GPUI 0.3.12);
 zorite-editor 0.11.3 was compiled and rendered with Kit on Windows.
 Inter and JetBrains Mono are embedded; their OFL licenses are in assets/fonts.
-The executable icon is generated specifically for this app.
+The title-bar and executable icons use the user-supplied Jira artwork in
+`assets/jira.webp`. Run `cargo run --example prepare_icon --offline` to regenerate
+the embedded PNG and multi-resolution Windows ICO. Keep the title bar to the
+icon and app name, without a workspace/account suffix.
 
 Commands (PowerShell, repository root):
 
@@ -142,6 +145,9 @@ and checked natively. The final follow-up review was attempted but failed becaus
 organizational Claude Code subscription access was disabled. Authenticated
 Jira writes still need validation against an account/project; local HTTP
 fixtures cover search token pagination, 204 updates and authentication errors.
+Title-bar branding was checked in the native demo and the live window's large
+icon was extracted to verify the taskbar artwork. That Claude review attempt
+was also blocked by the same organizational access error.
 
 Release measurement (2026-11-13): 19,018,752 bytes (18.1 MiB). The release
 demo reports 423.88 ms from Rust main to the second-frame callback. This upper

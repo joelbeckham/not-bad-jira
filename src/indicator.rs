@@ -25,6 +25,9 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == "images/jira.png" {
+            return Ok(Some(Cow::Borrowed(include_bytes!("../assets/jira.png"))));
+        }
         if let Some(asset) = IndicatorAssets.load(path)? {
             return Ok(Some(asset));
         }

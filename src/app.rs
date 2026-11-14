@@ -3198,18 +3198,8 @@ impl Render for AppView {
                         .flex()
                         .items_center()
                         .gap_3()
-                        .child(
-                            div()
-                                .text_color(rgb(0x91b9f7))
-                                .font_weight(FontWeight::BOLD)
-                                .child("◈"),
-                        )
-                        .child("not-bad-jira")
-                        .child(muted(if self.demo {
-                            " / Demo workspace"
-                        } else {
-                            " / Jira Cloud"
-                        })),
+                        .child(img("images/jira.png").size(px(16.)).flex_shrink_0())
+                        .child("not-bad-jira"),
                 ),
             )
             .child(body)
