@@ -87,6 +87,15 @@ the input with its query intact; its mouse events must not reach the workspace
 handler that focuses the list. Property popup and related filters keep their
 own typing/navigation behavior.
 
+In the main issue list, vertical wheel motion moves the selection at most one
+row per event, even when Windows reports multiple lines per notch. Accumulate
+fractional motion without queuing excess whole rows. Keep the viewport
+still while the selection is visible; reveal it with `ScrollStrategy::Nearest`
+only at an edge. Keyboard row navigation uses the same reveal behavior. Ignore
+horizontal wheel motion for row selection. Do not steal focus from the filter
+or change popup/detail scrolling. `--demo --demo-list` supplies 80 sample rows
+for native checks; `scripts/post-test-wheel.ps1` targets only the given app PID.
+
 Brief action notices use the existing bottom-left footer status area for copying keys
 or URLs, launching browser/config actions, sorting, and successful mutations.
 Keep the accompanying icon and concise, non-focusable text; do not add a floating
@@ -167,7 +176,7 @@ An in-use build may be retained as `target/release/not-bad-jira-running-<pid>.ex
 to keep its draft window open during an update. Keep that file until the process
 exits; Windows may still report the process's original executable path.
 
-Validation on 2026-11-14: 43 tests pass; Clippy passes with `-D warnings`.
+Validation on 2026-11-14: 46 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
 Main-filter checks also cover Enter/Down focus handoff without opening/skipping,
@@ -186,6 +195,14 @@ Footer notice placement, return to the underlying status, sorting feedback and
 immediate creation validation were checked natively in
 `design/reviews/footer-notice-*.png`. Notices share the existing footer rather
 than overlaying the content; the confirmation icon is retained.
+Wheel checks cover selection within the viewport, edge reveal, reversal,
+horizontal input, both list boundaries, Enter drill-in, filtered and empty
+results, plus subsequent keyboard navigation. Multi-line wheel input advances
+exactly one row in either direction, with no queued whole-row movement.
+Screenshots are in
+`design/reviews/wheel-*.png`; Claude remains skipped while offline at the user's
+request. Unit tests cover fractional deltas, direction changes, idle reset and
+empty/shortened lists.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,
 Enter selection, mouse selection, Escape, no matches, current-value preservation
 and scrolling to a current value beyond the first eight options.

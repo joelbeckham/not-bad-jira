@@ -14,6 +14,7 @@ mod priority;
 mod related;
 mod status;
 mod store;
+mod wheel;
 fn main() {
     let started = std::time::Instant::now();
     let measure = std::env::args().any(|a| a == "--measure-startup");

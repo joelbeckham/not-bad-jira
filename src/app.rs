@@ -89,6 +89,7 @@ pub struct AppView {
     saving: bool,
     sort: std::collections::HashMap<usize, (String, u8)>,
     list_scroll: UniformListScrollHandle,
+    list_wheel: crate::wheel::RowWheel,
     detail_scroll: ScrollHandle,
     detail_offsets: HashMap<String, Point<Pixels>>,
     related_views: RefCell<HashMap<(String, String), RelatedView>>,
@@ -163,6 +164,7 @@ impl AppView {
             palette: false,
             sort: Default::default(),
             list_scroll: UniformListScrollHandle::new(),
+            list_wheel: crate::wheel::RowWheel::default(),
             detail_scroll: ScrollHandle::new(),
             detail_offsets: Default::default(),
             related_views: Default::default(),
@@ -237,6 +239,7 @@ impl AppView {
             window,
             |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.list_wheel = crate::wheel::RowWheel::default();
                     this.selected = 0;
                     this.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
                     cx.notify();
@@ -2309,6 +2312,15 @@ impl AppView {
         let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("PLATFORM-12345","Review empty states","To Do","Lowest","Unassigned")].iter().enumerate().map(|(i,(key,summary,status,priority,assignee))|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"issuetype":{"name":(["Task","Story","Bug","Epic","Sub-task"][i]),"subtask":i==4},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.demo_related();
+        if std::env::args().any(|arg| arg == "--demo-list") {
+            for number in 300..375 {
+                let mut issue = self.store.issues["NBJ-102"].clone();
+                issue.key = format!("NBJ-{number}");
+                issue.fields["summary"] = json!(format!("Sample issue {number}"));
+                self.store.tabs[0].push(issue.key.clone());
+                self.store.merge_issue(issue);
+            }
+        }
         if std::env::args().any(|arg| arg == "--demo-dates") {
             self.config.as_mut().unwrap().tabs[0].columns =
                 ["key", "priority", "summary", "status", "updated"]
@@ -2478,6 +2490,7 @@ impl AppView {
         self.run_command(&action.key, window, cx);
     }
     fn run_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_wheel = crate::wheel::RowWheel::default();
         self.palette = false;
         self.related_navigation = None;
         self.focus.focus(window, cx);
@@ -2697,7 +2710,7 @@ impl AppView {
         }
         if n > 0 {
             self.list_scroll
-                .scroll_to_item(self.selected.min(n - 1), ScrollStrategy::Top);
+                .scroll_to_item(self.selected.min(n - 1), ScrollStrategy::Nearest);
         }
         cx.notify();
     }
@@ -3305,6 +3318,8 @@ impl Render for AppView {
                                                 }))
                                                 .on_click(cx.listener(
                                                     move |this, event: &ClickEvent, _, cx| {
+                                                        this.list_wheel =
+                                                            crate::wheel::RowWheel::default();
                                                         this.selected = i;
                                                         if event.click_count() == 2 {
                                                             this.open(key.clone());
@@ -3341,6 +3356,23 @@ impl Render for AppView {
                             ),
                         )
                         .track_scroll(&self.list_scroll)
+                        .overflow_y_hidden()
+                        .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
+                            if this.picker.is_some() || this.palette {
+                                return;
+                            }
+                            let delta = event.delta.pixel_delta(px(32.)).y / px(32.);
+                            if delta == 0. {
+                                return;
+                            }
+                            let count = this.keys(cx).len();
+                            this.selected = this.list_wheel.advance(delta, this.selected, count);
+                            this.list_scroll
+                                .scroll_to_item(this.selected, ScrollStrategy::Nearest);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
                         .w_full()
                         .flex_1()
                         .min_h_0(),
