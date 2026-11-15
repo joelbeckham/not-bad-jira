@@ -96,6 +96,14 @@ horizontal wheel motion for row selection. Do not steal focus from the filter
 or change popup/detail scrolling. `--demo --demo-list` supplies 80 sample rows
 for native checks; `scripts/post-test-wheel.ps1` targets only the given app PID.
 
+Issue context menus contain only actions for the clicked issue. Keep navigation,
+refresh, creation, account/config and quit commands in the general palette.
+Show shortcuts in the existing `keycap` style, lowercase and aligned to the
+right without parentheses. Group editing, sharing and deletion with separators.
+Capture the issue key and resolve its current row when an action runs; a refreshed or
+reordered list must never redirect a menu action to another issue. Custom menu
+labels use accessible text values so their parent menu items retain names.
+
 Brief action notices use the existing bottom-left footer status area for copying keys
 or URLs, launching browser/config actions, sorting, and successful mutations.
 Keep the accompanying icon and concise, non-focusable text; do not add a floating
@@ -203,6 +211,10 @@ Screenshots are in
 `design/reviews/wheel-*.png`; Claude remains skipped while offline at the user's
 request. Unit tests cover fractional deltas, direction changes, idle reset and
 empty/shortened lists.
+Issue context menus were checked for issue-only contents, right-click selection
+of an unselected row, mouse priority changes on that issue, keyboard opening and
+Escape dismissal. See `design/reviews/issue-context-menu.png`. Claude remains
+skipped while offline at the user's request.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,
 Enter selection, mouse selection, Escape, no matches, current-value preservation
 and scrolling to a current value beyond the first eight options.

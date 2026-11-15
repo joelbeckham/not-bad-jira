@@ -3192,6 +3192,7 @@ impl Render for AppView {
                                             let issue = this.store.issues.get(&keys[i]).unwrap();
                                             let selected = i == this.selected;
                                             let key = issue.key.clone();
+                                            let context_key = key.clone();
                                             let weak = cx.entity().downgrade();
                                             div()
                                                 .id(("issue", i))
@@ -3327,22 +3328,43 @@ impl Render for AppView {
                                                         cx.notify();
                                                     },
                                                 ))
-                                                .context_menu(move |mut menu, _, _| {
-                                                    for (command, label) in crate::actions::COMMANDS
-                                                    {
-                                                        let command = command.to_string();
+                                                .context_menu(move |mut menu, _, cx| {
+                                                    let _ = weak.update(cx, |this, cx| {
+                                                        if let Some(index) = this.keys(cx).iter().position(|key| key == &context_key) {
+                                                            this.selected = index;
+                                                            this.list_wheel = crate::wheel::RowWheel::default();
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                    menu = menu.min_w(px(240.));
+                                                    for (command, label) in crate::actions::issue_commands() {
+                                                        if matches!(command, "s" | "y" | "delete") {
+                                                            menu = menu.separator();
+                                                        }
                                                         let weak = weak.clone();
+                                                        let issue_key = context_key.clone();
                                                         menu = menu.item(
-                                                            PopupMenuItem::new(format!(
-                                                                "{label}    {command}"
-                                                            ))
+                                                            PopupMenuItem::element(move |_, _| {
+                                                                div()
+                                                                    .id(SharedString::from(format!("issue-menu-{command}")))
+                                                                    .w(px(224.))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap_4()
+                                                                    .role(Role::Label)
+                                                                    .aria_value(label)
+                                                                    .child(div().flex_1().child(label))
+                                                                    .child(keycap(command).flex_shrink_0())
+                                                            })
                                                             .on_click(move |_, window, cx| {
                                                                 let _ =
                                                                     weak.update(cx, |this, cx| {
-                                                                        this.selected = i;
-                                                                        this.run_command(
-                                                                            &command, window, cx,
-                                                                        );
+                                                                        if let Some(index) = this.keys(cx).iter().position(|key| key == &issue_key) {
+                                                                            this.selected = index;
+                                                                            this.run_command(command, window, cx);
+                                                                        } else {
+                                                                            this.show_notice("Issue is no longer in this list", false);
+                                                                        }
                                                                         cx.notify();
                                                                     });
                                                             }),

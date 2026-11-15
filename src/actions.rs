@@ -26,6 +26,19 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-shift-c", "Connect account"),
     ("q", "Quit"),
 ];
+pub fn issue_commands() -> impl Iterator<Item = (&'static str, &'static str)> {
+    [
+        "enter", "s", "p", "a", "t", "e", "m", "i", "d", "y", "u", "o", "delete",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        COMMANDS
+            .iter()
+            .copied()
+            .find(|(command, _)| *command == key)
+    })
+}
+
 pub fn bind(cx: &mut App) {
     for (i, key) in [
         "shift-1", "shift-2", "shift-3", "shift-4", "shift-5", "shift-6", "shift-7", "shift-8",
