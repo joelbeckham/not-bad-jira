@@ -18,6 +18,7 @@ url = "2.5"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 sha2 = "0.10.9"
 resvg = { version = "0.46.0", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 
 [build-dependencies]
 embed-resource = "3"

@@ -14,6 +14,20 @@ pub struct CreatedIssue {
     pub detail_error: Option<String>,
 }
 impl Issue {
+    pub fn list_field(&self, name: &str) -> String {
+        let value = self.field(name);
+        if matches!(name, "created" | "updated" | "duedate") {
+            // Keep Jira's calendar date, including date-only due dates.
+            if let Some(date) = value
+                .get(..10)
+                .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+            {
+                return date.format("%b %-d, %Y").to_string();
+            }
+        }
+        value
+    }
+
     pub fn field(&self, name: &str) -> String {
         let v = &self.fields[name];
         v.as_str()
@@ -282,6 +296,41 @@ mod tests {
         });
         (url, handle)
     }
+    #[test]
+    fn list_dates_keep_the_calendar_day_and_raw_timestamps() {
+        let issue = Issue {
+            key: "T-1".into(),
+            fields: json!({
+                "updated":"2026-10-27T23:33:48.174-0600",
+                "created":"2026-01-01T00:15:00+14:00",
+                "duedate":"2024-02-29", "summary":"2026-10-27T23:33:48.174-0600"
+            }),
+        };
+        assert_eq!(issue.list_field("updated"), "Oct 27, 2026");
+        assert_eq!(issue.list_field("created"), "Jan 1, 2026");
+        assert_eq!(issue.list_field("duedate"), "Feb 29, 2024");
+        assert_eq!(issue.field("updated"), "2026-10-27T23:33:48.174-0600");
+        assert_eq!(issue.list_field("summary"), issue.field("summary"));
+    }
+
+    #[test]
+    fn unavailable_or_unrecognized_list_dates_are_preserved() {
+        for value in [
+            Value::Null,
+            json!(""),
+            json!("Not scheduled"),
+            json!("2025-02-29"),
+            json!("2026-13-01"),
+            json!("éééééé"),
+        ] {
+            let issue = Issue {
+                key: "T-1".into(),
+                fields: json!({"updated":value}),
+            };
+            assert_eq!(issue.list_field("updated"), issue.field("updated"));
+        }
+    }
+
     #[test]
     fn search_uses_token_pagination() {
         let (url, server) = mock(vec![

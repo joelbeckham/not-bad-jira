@@ -87,6 +87,12 @@ the input with its query intact; its mouse events must not reach the workspace
 handler that focuses the list. Property popup and related filters keep their
 own typing/navigation behavior.
 
+List `created`, `updated` and `duedate` cells show short calendar dates such as
+`Oct 27, 2026`, using Jira's date without timezone conversion. `Issue::list_field`
+formats display values; raw timestamps remain intact for sorting and caching.
+Fixed-width text columns stay on one line with ellipsis when necessary.
+Use `--demo --demo-dates` for a native date-column preview.
+
 `src/avatar.rs` loads assignee avatars from Jira's `avatarUrls`. Rendering only
 uses memory and a bounded queue; a separate disk worker keeps cache hits clear
 of the two HTTP workers. Cached images work before account authentication and
@@ -151,12 +157,16 @@ An in-use build may be retained as `target/release/not-bad-jira-running-<pid>.ex
 to keep its draft window open during an update. Keep that file until the process
 exits; Windows may still report the process's original executable path.
 
-Validation on 2026-11-13: 41 tests pass; Clippy passes with `-D warnings`.
+Validation on 2026-11-14: 43 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
 Main-filter checks also cover Enter/Down focus handoff without opening/skipping,
 second Enter opening the selected row, slash refocusing with query preserved,
 actual mouse clicks on filter text restoring typing and safe empty results.
+Date formatting checks cover calendar-day preservation across timezone offsets,
+date-only due dates, leap days and missing/malformed values. The native date
+column was checked in `design/reviews/list-dates.png`; Claude review was skipped
+for this change at the user's request.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,
 Enter selection, mouse selection, Escape, no matches, current-value preservation
 and scrolling to a current value beyond the first eight options.

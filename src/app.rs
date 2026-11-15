@@ -2214,6 +2214,22 @@ impl AppView {
         let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("PLATFORM-12345","Review empty states","To Do","Lowest","Unassigned")].iter().enumerate().map(|(i,(key,summary,status,priority,assignee))|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"issuetype":{"name":(["Task","Story","Bug","Epic","Sub-task"][i]),"subtask":i==4},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.demo_related();
+        if std::env::args().any(|arg| arg == "--demo-dates") {
+            self.config.as_mut().unwrap().tabs[0].columns =
+                ["key", "priority", "summary", "status", "updated"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+            for (key, updated) in [
+                ("NBJ-101", "2026-10-27T23:33:48.174-0600"),
+                ("NBJ-102", "2026-01-01T00:15:00+14:00"),
+                ("NBJ-103", "2025-12-31T23:59:59.999-1200"),
+                ("NBJ-104", "2024-02-29T12:00:00Z"),
+                ("PLATFORM-12345", "2026-11-14T08:30:00-0700"),
+            ] {
+                self.store.issues.get_mut(key).unwrap().fields["updated"] = json!(updated);
+            }
+        }
         self.status = "Demo workspace · sample data".into();
     }
     fn demo_related(&mut self) {
@@ -2685,6 +2701,8 @@ fn column(text: String, width: f32) -> Div {
         .w(px(width))
         .flex_shrink_0()
         .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
         .child(text)
 }
 fn adf_text(v: &Value) -> String {
@@ -3117,7 +3135,7 @@ impl Render for AppView {
                                                     let value = if field == "key" {
                                                         issue.key.clone()
                                                     } else {
-                                                        issue.field(if field == "type" {
+                                                        issue.list_field(if field == "type" {
                                                             "issuetype"
                                                         } else {
                                                             field
