@@ -87,6 +87,16 @@ the input with its query intact; its mouse events must not reach the workspace
 handler that focuses the list. Property popup and related filters keep their
 own typing/navigation behavior.
 
+Brief action notices use the existing bottom-left footer status area for copying keys
+or URLs, launching browser/config actions, sorting, and successful mutations.
+Keep the accompanying icon and concise, non-focusable text; do not add a floating
+card or a second status area. The latest notice replaces the previous one and
+expires after 3.5 seconds, restoring the underlying status. New errors, progress
+and editing actions dismiss the notice so they are visible immediately.
+Only confirm Jira writes after a successful response; opening an external app
+is a request, so use "Opening", without claiming it finished. Clear notices
+when changing accounts. Avoid notices for ordinary navigation or typing.
+
 List `created`, `updated` and `duedate` cells show short calendar dates such as
 `Oct 27, 2026`, using Jira's date without timezone conversion. `Issue::list_field`
 formats display values; raw timestamps remain intact for sorting and caching.
@@ -167,6 +177,15 @@ Date formatting checks cover calendar-day preservation across timezone offsets,
 date-only due dates, leap days and missing/malformed values. The native date
 column was checked in `design/reviews/list-dates.png`; Claude review was skipped
 for this change at the user's request.
+Action-notice checks cover clipboard key/URL contents, retained keyboard focus,
+latest-message replacement/expiry, sort changes, field-update confirmation and
+empty selections. Clipboard tests restore the prior clipboard contents. Native
+screenshots are in `design/reviews/action-notice-*.png`; Claude remains skipped
+while offline at the user's request.
+Footer notice placement, return to the underlying status, sorting feedback and
+immediate creation validation were checked natively in
+`design/reviews/footer-notice-*.png`. Notices share the existing footer rather
+than overlaying the content; the confirmation icon is retained.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,
 Enter selection, mouse selection, Escape, no matches, current-value preservation
 and scrolling to a current value beyond the first eight options.

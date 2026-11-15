@@ -27,13 +27,18 @@ struct RelatedView {
     selected: usize,
     anchor: ScrollAnchor,
 }
+struct ActionNotice {
+    message: String,
+    expires: std::time::Instant,
+    confirmed: bool,
+}
 
 enum Message {
     ConfigChanged(Result<Config, String>),
     Connected(Result<(Client, Value), String>),
     Tab(usize, u64, Result<Vec<Issue>, String>),
     Detail(u64, Result<Issue, String>),
-    Saved(String, Option<Issue>, Result<Value, String>),
+    Saved(String, Option<Issue>, String, Result<Value, String>),
     Created(u64, Result<CreatedIssue, String>),
     Choices(u64, Result<Vec<Choice>, String>),
     Related(u64, String, u64, Result<Vec<Issue>, String>),
@@ -61,6 +66,7 @@ pub struct AppView {
     selected: usize,
     stack: Vec<String>,
     status: String,
+    action_notice: Option<ActionNotice>,
     loading: usize,
     tx: Sender,
     rx: mpsc::Receiver<(u64, Message)>,
@@ -142,6 +148,7 @@ impl AppView {
             selected: 0,
             stack: Vec::new(),
             status: String::new(),
+            action_notice: None,
             loading: 0,
             tx,
             rx,
@@ -288,6 +295,7 @@ impl AppView {
         this
     }
     fn connect_existing(&mut self) {
+        self.action_notice = None;
         self.connecting = true;
         self.tx.epoch += 1;
         let c = self.config.clone().unwrap();
@@ -304,6 +312,7 @@ impl AppView {
         });
     }
     fn connect(&mut self, cx: &mut Context<Self>) {
+        self.action_notice = None;
         if self.connecting {
             return;
         }
@@ -370,6 +379,14 @@ impl AppView {
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.avatars.poll();
+        if self
+            .action_notice
+            .as_ref()
+            .is_some_and(|notice| std::time::Instant::now() >= notice.expires)
+        {
+            self.action_notice = None;
+            changed = true;
+        }
         while let Ok((epoch, message)) = self.rx.try_recv() {
             if epoch != u64::MAX && epoch != self.tx.epoch {
                 continue;
@@ -382,6 +399,7 @@ impl AppView {
                     }
                 }
                 Message::ConfigChanged(Err(e)) => {
+                    self.action_notice = None;
                     self.status = format!("Config reload failed: {e}")
                 }
                 Message::Connected(Ok((client, user))) => {
@@ -396,6 +414,7 @@ impl AppView {
                     self.refresh();
                 }
                 Message::Connected(Err(e)) => {
+                    self.action_notice = None;
                     self.connecting = false;
                     self.status = format!("Connection failed: {e}");
                 }
@@ -435,6 +454,7 @@ impl AppView {
                         }
                         Err(e) => {
                             self.refresh_errors.push(e.clone());
+                            self.action_notice = None;
                             self.status = format!("Refresh failed: {e}");
                         }
                     }
@@ -461,6 +481,7 @@ impl AppView {
                 }
                 Message::Detail(revision, Err(e)) => {
                     if revision == self.revision {
+                        self.action_notice = None;
                         self.status = format!("Could not load issue: {e}");
                     }
                 }
@@ -486,6 +507,7 @@ impl AppView {
                             self.create_error = None;
                             self.navigate_to(key.clone());
                             self.status = format!("Created {key}");
+                            self.show_notice(format!("Created {key}"), true);
                             if self.demo {
                                 self.store.tabs[self.tab].insert(0, key);
                             } else {
@@ -499,16 +521,18 @@ impl AppView {
                         }
                         Err(error) => {
                             self.create_error = Some(error);
+                            self.action_notice = None;
                             self.status.clear();
                         }
                     }
                 }
-                Message::Saved(key, old, result) => {
+                Message::Saved(key, old, notice, result) => {
                     self.saving = false;
                     match result {
                         Ok(data) => {
                             self.edit = None;
                             self.status = "Saved".into();
+                            self.show_notice(notice, true);
                             if data["deleted"] == true {
                                 self.store.issues.remove(&key);
                                 self.stack.retain(|k| k != &key);
@@ -535,6 +559,7 @@ impl AppView {
                             if let Some(old) = old {
                                 self.store.issues.insert(key, old);
                             }
+                            self.action_notice = None;
                             self.status = format!("Save failed; changes rolled back: {e}");
                         }
                     }
@@ -773,6 +798,57 @@ impl AppView {
         }
         self.edit = Some((key, kind.into(), doc));
     }
+    fn show_notice(&mut self, message: impl Into<String>, confirmed: bool) {
+        self.action_notice = Some(ActionNotice {
+            message: message.into(),
+            expires: std::time::Instant::now() + Duration::from_millis(3500),
+            confirmed,
+        });
+    }
+
+    fn render_footer_status(&self) -> AnyElement {
+        let (message, confirmed) = self
+            .action_notice
+            .as_ref()
+            .map(|notice| (notice.message.as_str(), Some(notice.confirmed)))
+            .unwrap_or((self.status.as_str(), None));
+        div()
+            .id("footer-status")
+            .h(px(20.))
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .gap_2()
+            .role(Role::Status)
+            .aria_label(message.to_string())
+            .children(confirmed.map(|confirmed| {
+                gpui_kit::component::Icon::new(if confirmed {
+                    gpui_kit::assets::IconName::CircleCheck
+                } else {
+                    gpui_kit::assets::IconName::CircleDot
+                })
+                .size(px(16.))
+                .text_color(rgb(if confirmed { 0x83d4ac } else { 0x91b9f7 }))
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(12.))
+                    .text_color(rgb(if confirmed.is_some() {
+                        0xe6ebf3
+                    } else {
+                        0x929cad
+                    }))
+                    .child(message.to_string()),
+            )
+            .into_any_element()
+    }
+
     fn mutate(
         &mut self,
         key: String,
@@ -781,6 +857,7 @@ impl AppView {
         body: Value,
         optimistic: Option<Value>,
     ) {
+        self.action_notice = None;
         if self.saving {
             self.status = "Wait for the current change to finish.".into();
             return;
@@ -790,6 +867,18 @@ impl AppView {
             return;
         };
         let old = self.store.issues.get(&key).cloned();
+        let notice = if method == "DELETE" {
+            format!("Deleted {key}")
+        } else if path.ends_with("/comment") {
+            format!("Added comment to {key}")
+        } else {
+            optimistic
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|fields| fields.iter().next())
+                .map(|(field, value)| change_confirmation(&key, field, value))
+                .unwrap_or_else(|| format!("Saved {key}"))
+        };
         if let Some(fields) = optimistic
             && let Some(issue) = self.store.issues.get_mut(&key)
         {
@@ -813,10 +902,11 @@ impl AppView {
                     }
                 })
                 .map_err(|e| e.to_string());
-            let _ = tx.send(Message::Saved(key, old, result));
+            let _ = tx.send(Message::Saved(key, old, notice, result));
         });
     }
     fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.action_notice = None;
         let Some((key, kind, doc)) = &self.edit else {
             return;
         };
@@ -1052,8 +1142,11 @@ impl AppView {
         let key = picker.key;
         let id = choice.id;
         if self.demo && ["status", "done", "priority", "assignee"].contains(&kind.as_str()) {
+            let field = if kind == "done" { "status" } else { &kind };
+            let notice = change_confirmation(&key, field, &choice.value);
             if let Some(issue) = self.store.issues.get_mut(&key) {
-                issue.fields[if kind == "done" { "status" } else { &kind }] = choice.value;
+                issue.fields[field] = choice.value;
+                self.show_notice(notice, true);
             }
             return;
         }
@@ -1093,6 +1186,7 @@ impl AppView {
     }
 
     fn begin_create(&mut self, issue_type: Value) {
+        self.action_notice = None;
         if self.saving {
             return;
         }
@@ -2189,6 +2283,7 @@ impl AppView {
     }
 
     fn demo(&mut self) {
+        self.action_notice = None;
         self.tx.epoch += 1;
         self.connecting = false;
         self.client = None;
@@ -2386,8 +2481,11 @@ impl AppView {
         self.palette = false;
         self.related_navigation = None;
         self.focus.focus(window, cx);
-        if self.saving && ["s", "p", "a", "t", "e", "m", "c", "delete", "d", "i"].contains(&command)
-        {
+        let edits = ["s", "p", "a", "t", "e", "m", "c", "delete", "d", "i"].contains(&command);
+        if edits || command == "r" {
+            self.action_notice = None;
+        }
+        if self.saving && edits {
             self.status = "Wait for the current change to finish.".into();
             cx.notify();
             return;
@@ -2482,6 +2580,7 @@ impl AppView {
                     "file:///{}",
                     crate::config::path().to_string_lossy().replace('\\', "/")
                 ));
+                self.show_notice("Opening config file", false);
             }
             "ctrl-shift-c" => {
                 if self.saving {
@@ -2517,6 +2616,7 @@ impl AppView {
                 self.related_pending.clear();
                 self.related_errors.clear();
                 self.status.clear();
+                self.action_notice = None;
             }
             "delete" => {
                 if let Some(key) = self.current(cx) {
@@ -2569,10 +2669,21 @@ impl AppView {
                         key
                     );
                     match command {
-                        "y" => cx.write_to_clipboard(ClipboardItem::new_string(key)),
-                        "u" => cx.write_to_clipboard(ClipboardItem::new_string(url)),
-                        _ => cx.open_url(&url),
+                        "y" => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(key.clone()));
+                            self.show_notice(format!("Copied issue key {key}"), true);
+                        }
+                        "u" => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(url));
+                            self.show_notice(format!("Copied URL for {key}"), true);
+                        }
+                        _ => {
+                            cx.open_url(&url);
+                            self.show_notice(format!("Opening {key} in browser"), false);
+                        }
                     }
+                } else {
+                    self.show_notice("No issue selected", false);
                 }
             }
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
@@ -2597,8 +2708,20 @@ impl AppView {
             .filter(|(f, _)| f == &field)
             .map(|(_, m)| (m + 1) % 3)
             .unwrap_or(0);
+        let label = match field.as_str() {
+            "key" => "issue key",
+            "duedate" => "due date",
+            "type" | "issuetype" => "issue type",
+            _ => &field,
+        };
+        let notice = match mode {
+            0 => format!("Sorted by {label}: ascending"),
+            1 => format!("Sorted by {label}: descending"),
+            _ => "Restored default issue order".into(),
+        };
         self.sort.insert(self.tab, (field, mode));
         self.selected = 0;
+        self.show_notice(notice, true);
     }
     fn palette_execute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.inputs[5].read(cx).value().to_string();
@@ -2639,6 +2762,29 @@ impl AppView {
         }
     }
 }
+fn change_confirmation(key: &str, field: &str, value: &Value) -> String {
+    let label = value["displayName"]
+        .as_str()
+        .or_else(|| value["name"].as_str())
+        .or_else(|| value.as_str())
+        .filter(|label| !label.is_empty());
+    match field {
+        "summary" => format!("Updated title for {key}"),
+        "description" => format!("Updated description for {key}"),
+        "status" => label
+            .map(|label| format!("{key}: {label}"))
+            .unwrap_or_else(|| format!("Updated status for {key}")),
+        "priority" => label
+            .map(|label| format!("{key} priority: {label}"))
+            .unwrap_or_else(|| format!("Updated priority for {key}")),
+        "assignee" if value.is_null() => format!("Unassigned {key}"),
+        "assignee" => label
+            .map(|label| format!("Assigned {key} to {label}"))
+            .unwrap_or_else(|| format!("Updated assignee for {key}")),
+        _ => format!("Saved {key}"),
+    }
+}
+
 fn fuzzy(query: &str, text: &str) -> bool {
     let lower = text.to_lowercase();
     let mut chars = lower.chars();
@@ -3002,6 +3148,8 @@ impl Render for AppView {
                                 cell(field.to_uppercase(), &field)
                                     .id(("column", i))
                                     .cursor_pointer()
+                                    .role(Role::Button)
+                                    .aria_label(format!("Sort by {field}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.cycle_sort(field.clone());
                                         cx.notify();
@@ -3526,13 +3674,14 @@ impl Render for AppView {
                     .border_t_1()
                     .border_color(rgb(0x303744))
                     .child(
-                        muted(self.status.clone())
+                        div()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .pr_4(),
+                            .pr_4()
+                            .child(self.render_footer_status()),
                     )
                     .child(shortcuts),
             )
