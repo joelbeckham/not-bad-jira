@@ -80,6 +80,13 @@ transition action ID separate from the target status ID, and preserve target
 status categories for icons. Demo field selections change sample data only in
 memory.
 
+In the main issue filter, Enter or Down hands focus to the issue list without
+opening an issue or skipping the selected row. Typing a new query resets list
+selection to the first match. Clicking the filter text or pressing `/` focuses
+the input with its query intact; its mouse events must not reach the workspace
+handler that focuses the list. Property popup and related filters keep their
+own typing/navigation behavior.
+
 `src/avatar.rs` loads assignee avatars from Jira's `avatarUrls`. Rendering only
 uses memory and a bounded queue; a separate disk worker keeps cache hits clear
 of the two HTTP workers. Cached images work before account authentication and
@@ -122,7 +129,8 @@ unrecognized structure with empty text. Existing blocks with unsupported layout
 attributes stay protected. Creating issues can fail when a Jira project requires
 additional custom fields; retain the summary and show Jira's validation error.
 Keep the creation editor visible through issue-type selection and the create
-request. While pending, show the spinner/status, disable summary/submit/cancel,
+request. Label its primary action and footer hint `Create`, with `Creating…`
+while pending. Show the spinner/status, disable summary/submit/cancel,
 and consume duplicate submission/cancel keys. Only navigate to the new issue
 after the create worker returns its details. Preserve the draft and inline error
 on rejection. A failed detail fetch after successful POST must open the confirmed
@@ -139,10 +147,16 @@ Pass `-TargetProcessId` to native smoke and capture scripts so a closed preview
 cannot redirect a check to another app window.
 Before replacing a running app, preserve open editors/type pickers and pending
 `Saving…` or `Creating…` requests; never discard a user's draft for a rebuild.
+An in-use build may be retained as `target/release/not-bad-jira-running-<pid>.exe`
+to keep its draft window open during an update. Keep that file until the process
+exits; Windows may still report the process's original executable path.
 
 Validation on 2026-11-13: 41 tests pass; Clippy passes with `-D warnings`.
 Native smoke checks cover list filtering, J/Enter detail navigation, command
 filtering, issue-key search + Enter, summary editor and setup.
+Main-filter checks also cover Enter/Down focus handoff without opening/skipping,
+second Enter opening the selected row, slash refocusing with query preserved,
+actual mouse clicks on filter text restoring typing and safe empty results.
 Field picker checks cover live typing, retained filter focus, Up/Down navigation,
 Enter selection, mouse selection, Escape, no matches, current-value preservation
 and scrolling to a current value beyond the first eight options.

@@ -225,6 +225,17 @@ impl AppView {
         });
         this.subscriptions
             .push(cx.observe(&this.inputs[4], |_, _, cx| cx.notify()));
+        this.subscriptions.push(cx.subscribe_in(
+            &this.inputs[4],
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.selected = 0;
+                    this.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    cx.notify();
+                }
+            },
+        ));
         this.subscriptions
             .push(cx.observe(&this.inputs[5], |_, _, cx| cx.notify()));
         this.subscriptions.push(cx.subscribe_in(
@@ -1140,7 +1151,40 @@ impl AppView {
         });
     }
 
+    fn list_filter_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.config.is_none()
+            || !self.stack.is_empty()
+            || self.edit.is_some()
+            || self.picker.is_some()
+            || self.palette
+            || !self.inputs[4].read(cx).focus_handle(cx).is_focused(window)
+            || event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform
+            || event.keystroke.modifiers.shift
+            || !matches!(event.keystroke.key.as_str(), "enter" | "down")
+        {
+            return false;
+        }
+        self.selected = self.selected.min(self.keys(cx).len().saturating_sub(1));
+        self.list_scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
+        self.focus.focus(window, cx);
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+        true
+    }
+
     fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.list_filter_key(event, window, cx) {
+            return;
+        }
         if self.create_pending.is_some()
             && matches!(event.keystroke.key.as_str(), "escape" | "enter")
         {
@@ -1256,13 +1300,23 @@ impl AppView {
             shortcuts
         } else if self.edit.is_some() {
             shortcuts
-                .child(self.shortcut_button(
-                    "footer-save",
-                    &["Ctrl+Enter"],
-                    "Save",
-                    "save-edit",
-                    cx,
-                ))
+                .child(
+                    self.shortcut_button(
+                        "footer-save",
+                        &["Ctrl+Enter"],
+                        if self
+                            .edit
+                            .as_ref()
+                            .is_some_and(|(_, kind, _)| kind == "create")
+                        {
+                            "Create"
+                        } else {
+                            "Save"
+                        },
+                        "save-edit",
+                        cx,
+                    ),
+                )
                 .child(self.shortcut_button("footer-cancel", &["Esc"], "Cancel", "escape", cx))
         } else {
             shortcuts
@@ -2898,7 +2952,22 @@ impl Render for AppView {
                             .flex()
                             .items_center()
                             .gap_4()
-                            .child(div().w(px(360.)).child(Input::new(&self.inputs[4]).small()))
+                            .child(
+                                div()
+                                    .id("issue-filter")
+                                    .w(px(360.))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.picker = None;
+                                        this.inputs[4]
+                                            .update(cx, |input, cx| input.focus(window, cx));
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                                    .child(Input::new(&self.inputs[4]).small()),
+                            )
                             .child(muted(format!("{count} issues"))),
                     )
                     .child(
@@ -3310,6 +3379,8 @@ impl Render for AppView {
                                         "Creating…"
                                     } else if self.saving {
                                         "Saving…"
+                                    } else if kind == "create" {
+                                        "Create"
                                     } else {
                                         "Save changes"
                                     })
