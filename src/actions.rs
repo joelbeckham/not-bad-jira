@@ -40,6 +40,14 @@ pub fn issue_commands() -> impl Iterator<Item = (&'static str, &'static str)> {
 }
 
 pub fn bind(cx: &mut App) {
+    // Registered after zorite-editor's bindings so Escape cancels the host edit.
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        Command {
+            key: "cancel-edit".into(),
+        },
+        Some("Editor"),
+    )]);
     for (i, key) in [
         "shift-1", "shift-2", "shift-3", "shift-4", "shift-5", "shift-6", "shift-7", "shift-8",
         "shift-9",

@@ -1289,6 +1289,18 @@ impl AppView {
             cx.stop_propagation();
             return;
         }
+        // Handle cancellation before the focused Markdown editor consumes Escape.
+        // A field popup owns Escape while open; pending writes keep their editor.
+        if self.edit.is_some() && self.picker.is_none() && event.keystroke.key == "escape" {
+            if !self.saving {
+                self.edit = None;
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if self.picker.is_none() && self.related_key(event, window, cx) {
             return;
         }
@@ -2491,6 +2503,14 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if action.key == "cancel-edit" && self.edit.is_some() && self.picker.is_none() {
+            if !self.saving && self.create_pending.is_none() {
+                self.edit = None;
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
+            return;
+        }
         if self.edit.is_some() || self.picker.is_some() || !self.focus.is_focused(window) {
             cx.propagate();
             return;

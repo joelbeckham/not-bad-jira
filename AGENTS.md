@@ -247,3 +247,12 @@ bound is not proof of the 150 ms cached-account startup target; actual first
 presentation, production-cache startup and input-latency profiling remain open.
 The release executable was launched successfully and its window was responsive.
 See design/reviews/release-final.png and design/reviews/startup.txt.
+
+Description-editor Escape check (2026-11-16): a single Escape cancels the edit
+even while the Markdown editor has focus, discards unsaved typing as requested,
+and restores focus to the same issue view. Pending writes retain their editor;
+open field pickers keep their own Escape behavior. The app overrides the editor's
+Dismiss key binding because it consumes Escape before raw key handlers.
+Native screenshots are `design/reviews/editor-escape-*.png`. Claude found no
+visual changes needed; its optional discard confirmation was not adopted because
+the requested behavior is single-Escape cancellation, matching the Cancel action.
