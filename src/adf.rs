@@ -151,9 +151,22 @@ impl Document {
                 return self.protect(v);
             }
             let mut text = raw
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_punctuation() {
+                .char_indices()
+                .map(|(i, c)| {
+                    // Keep ordinary prose and URLs readable. Retain escapes for
+                    // Markdown syntax, including possible block markers at node boundaries.
+                    let before = raw[..i].chars().next_back();
+                    let after = raw[i + c.len_utf8()..].chars().next();
+                    let literal = match c {
+                        ':' | '/' | ';' | ',' | '@' | '$' | '%' | '^' | '?' | '{' | '}' => true,
+                        '.' => before.is_some_and(|c| !c.is_ascii_digit()),
+                        '-' => {
+                            before.is_some_and(char::is_alphanumeric)
+                                && after.is_some_and(char::is_alphanumeric)
+                        }
+                        _ => !c.is_ascii_punctuation(),
+                    };
+                    if !literal {
                         format!("\\{c}")
                     } else {
                         c.to_string()
@@ -530,6 +543,23 @@ mod tests {
             let doc = Document::from_adf(&original);
             assert_eq!(doc.to_adf(&doc.markdown).unwrap(), original);
         }
+    }
+    #[test]
+    fn editor_keeps_urls_and_prose_readable() {
+        let text = "Invited James to app.bombbomb.com repo. GitHub username: at-1337-r";
+        let url = "https://github.com/bombbomb/app.bombbomb.com/settings/access";
+        let original = json!({"type":"doc","version":1,"content":[
+            {"type":"paragraph","content":[{"type":"text","text":text}]},
+            {"type":"paragraph","content":[{"type":"text","text":url}]}
+        ]});
+        let doc = Document::from_adf(&original);
+        assert_eq!(doc.markdown, format!("{text}\n\n{url}\n\n"));
+        assert_eq!(doc.to_adf(&doc.markdown).unwrap(), original);
+        let mut linked = original.clone();
+        linked["content"][1]["content"][0]["marks"] = json!([{"type":"link","attrs":{"href":url}}]);
+        let doc = Document::from_adf(&linked);
+        assert_eq!(doc.markdown, format!("{text}\n\n[{url}]({url})\n\n"));
+        assert_eq!(doc.to_adf(&doc.markdown).unwrap(), linked);
     }
     #[test]
     fn backticks_in_inline_code_survive() {
