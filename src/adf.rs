@@ -18,7 +18,12 @@ impl Document {
                 .unwrap_or_default();
             match v["type"].as_str().unwrap_or("") {
                 "text" => {
-                    let mut s = v["text"].as_str().unwrap_or("").to_string();
+                    let mut s = v["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .replace('\n', "  \n");
                     for m in v["marks"].as_array().into_iter().flatten() {
                         s = match m["type"].as_str().unwrap_or("") {
                             "strong" => format!("**{s}**"),
@@ -39,8 +44,14 @@ impl Document {
                     "#".repeat(v["attrs"]["level"].as_u64().unwrap_or(1) as usize)
                 ),
                 "codeBlock" => format!(
-                    "```{}\n{content}\n```\n\n",
-                    v["attrs"]["language"].as_str().unwrap_or("")
+                    "```{}\n{}\n```\n\n",
+                    v["attrs"]["language"].as_str().unwrap_or(""),
+                    v["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|node| node["text"].as_str().unwrap_or(""))
+                        .collect::<String>()
                 ),
                 "bulletList" | "orderedList" => {
                     v["content"]
@@ -141,8 +152,22 @@ impl Document {
         }
         if kind == "text" {
             let raw = v["text"].as_str().unwrap_or("");
-            if raw.contains(['\n', '\r']) || raw.contains("[ADF:") {
+            if raw.contains("[ADF:") {
                 return self.protect(v);
+            }
+            // Older saves embedded line breaks in text nodes. Recover those as
+            // editable lines, retaining marks and protected unsupported content.
+            if raw.contains(['\n', '\r']) {
+                let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+                return normalized
+                    .split('\n')
+                    .map(|line| {
+                        let mut node = v.clone();
+                        node["text"] = json!(line);
+                        self.render(&node)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  \n");
             }
             let all_marks = v["marks"].as_array();
             if all_marks.is_some_and(|a| {
@@ -353,7 +378,7 @@ if stack.len()>1 {let mut node=stack.pop().unwrap();finish_node(&mut node);push(
                     let mut node=json!({"type":"text","text":text.to_string()});if !marks.is_empty(){node["marks"]=json!(marks);}push(&mut stack,node);
                 },
                 Event::Code(text)=>{let mut active=marks.clone();active.push(json!({"type":"code"}));push(&mut stack,json!({"type":"text","text":text.to_string(),"marks":active}));},
-                Event::SoftBreak=>push(&mut stack,json!({"type":"text","text":"\n"})),
+                Event::SoftBreak=>push(&mut stack,json!({"type":"hardBreak"})),
                 Event::HardBreak=>push(&mut stack,json!({"type":"hardBreak"})),Event::Rule=>push(&mut stack,json!({"type":"rule"})),
                 Event::TaskListMarker(done)=>{task_counter+=1;let item=stack.iter_mut().rev().find(|n|n["type"]=="listItem").ok_or_else(||anyhow::anyhow!("Checklist item is outside a list"))?;item["type"]=json!("taskItem");item["attrs"]=json!({"localId":self.task_ids.get(task_counter-1).cloned().unwrap_or_else(||format!("task-{}-{task_counter}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos())),"state":if done{"DONE"}else{"TODO"}});let list=stack.iter_mut().rev().find(|n|n["type"]=="bulletList"||n["type"]=="taskList").ok_or_else(||anyhow::anyhow!("Checklist requires a bullet list"))?;if list["type"]=="bulletList"{list_counter+=1;list["type"]=json!("taskList");list["attrs"]=json!({"localId":self.list_ids.get(list_counter-1).cloned().unwrap_or_else(||format!("list-{}-{list_counter}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()))});}},
                 _=>bail!("This Markdown feature cannot be saved safely yet."),
@@ -489,6 +514,31 @@ fn restore(v: &mut Value, protected: &[Value]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn entered_lines_survive_save_and_reopen() {
+        let input = "34.216.59.33\n54.69.240.210\n35.90.42.16\n52.27.217.135\n34.215.163.132";
+        let saved = Document::default().to_adf(input).unwrap();
+        assert_eq!(
+            saved["content"][0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["type"] == "hardBreak")
+                .count(),
+            4
+        );
+        let reopened = Document::from_adf(&saved);
+        assert!(!reopened.markdown.contains("[ADF:"));
+        assert_eq!(reopened.to_adf(&reopened.markdown).unwrap(), saved);
+        let legacy = json!({"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":input}]}]});
+        let recovered = Document::from_adf(&legacy);
+        assert!(!recovered.markdown.contains("[ADF:"));
+        assert_eq!(recovered.to_adf(&recovered.markdown).unwrap(), saved);
+        assert_eq!(
+            Document::display(&legacy),
+            format!("{}\n\n", input.replace('\n', "  \n"))
+        );
+    }
     #[test]
     fn standard_block_roundtrips() {
         for node in [
