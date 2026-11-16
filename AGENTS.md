@@ -269,3 +269,12 @@ Native checks (2026-11-16) cover arrows across groups, both boundaries, scrollin
 filter focus and reset, selected Enter execution, exact-key opening, empty results
 and minimum-width ellipsis. See `design/reviews/palette-*.png`. Claude's initial
 and follow-up reviews were completed; substantive layout findings were applied.
+
+Description editor clicks focus the editor and stop mouse-down propagation before
+the workspace handler can reclaim focus. The whole bordered area uses the text
+cursor; padding and blank-space clicks restore the existing caret, while text
+clicks keep the editor's own caret hit testing. Native checks (2026-11-16) cover
+defocus/refocus on text, padding and blank space, subsequent typing, and Escape
+cancellation followed by reopening the original description. Screenshots are
+`design/reviews/editor-refocus-*.png`. Claude reviewed the focus states and found
+no visual changes necessary. All 47 tests and Clippy pass.

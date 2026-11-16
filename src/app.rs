@@ -3629,6 +3629,17 @@ impl Render for AppView {
             } else {
                 div()
                     .id("markdown-editor")
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.editor
+                                .update(cx, |editor, cx| editor.focus(window, cx));
+                            // The workspace click handler must not take focus back.
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
