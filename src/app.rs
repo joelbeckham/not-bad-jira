@@ -32,6 +32,11 @@ struct ActionNotice {
     expires: std::time::Instant,
     confirmed: bool,
 }
+enum PaletteRow {
+    Heading(&'static str),
+    Command(&'static str, &'static str),
+    Issue(String, String),
+}
 
 enum Message {
     ConfigChanged(Result<Config, String>),
@@ -79,6 +84,8 @@ pub struct AppView {
     picker_anchor: Point<Pixels>,
     field_bounds: FieldBounds,
     palette: bool,
+    palette_selected: usize,
+    palette_scroll: UniformListScrollHandle,
     subscriptions: Vec<Subscription>,
     create_summary: String,
     create_request: u64,
@@ -162,6 +169,8 @@ impl AppView {
             picker_anchor: point(px(24.), px(120.)),
             field_bounds: Default::default(),
             palette: false,
+            palette_selected: 1,
+            palette_scroll: UniformListScrollHandle::new(),
             sort: Default::default(),
             list_scroll: UniformListScrollHandle::new(),
             list_wheel: crate::wheel::RowWheel::default(),
@@ -254,6 +263,9 @@ impl AppView {
             |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.palette_execute(window, cx);
+                } else if matches!(event, InputEvent::Change) {
+                    this.reset_palette(cx);
+                    cx.notify();
                 }
             },
         ));
@@ -1279,6 +1291,29 @@ impl AppView {
     }
 
     fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette && matches!(event.keystroke.key.as_str(), "up" | "down") {
+            let rows = self.palette_rows(cx);
+            let indices: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| (!matches!(row, PaletteRow::Heading(_))).then_some(i))
+                .collect();
+            if let Some(position) = indices.iter().position(|i| *i == self.palette_selected) {
+                let next = if event.keystroke.key == "down" {
+                    (position + 1).min(indices.len() - 1)
+                } else {
+                    position.saturating_sub(1)
+                };
+                self.palette_selected = indices[next];
+                self.palette_scroll
+                    .scroll_to_item(self.palette_selected, ScrollStrategy::Nearest);
+            }
+            self.inputs[5].update(cx, |input, cx| input.focus(window, cx));
+            window.prevent_default();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.list_filter_key(event, window, cx) {
             return;
         }
@@ -1330,12 +1365,12 @@ impl AppView {
             shortcuts
                 .child(self.shortcut_button(
                     "footer-run",
-                    &["Enter"],
+                    &["enter"],
                     "Run or open",
                     "palette-enter",
                     cx,
                 ))
-                .child(self.shortcut_button("footer-close", &["Esc"], "Close", "escape", cx))
+                .child(self.shortcut_button("footer-close", &["esc"], "Close", "escape", cx))
         } else if self.picker.is_some() {
             shortcuts
                 .child(
@@ -2472,6 +2507,7 @@ impl AppView {
                     s.set_value("", window, cx);
                     s.focus(window, cx);
                 });
+                self.reset_palette(cx);
             } else {
                 self.focus.focus(window, cx);
             }
@@ -2764,42 +2800,66 @@ impl AppView {
         self.selected = 0;
         self.show_notice(notice, true);
     }
-    fn palette_execute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn palette_rows(&self, cx: &App) -> Vec<PaletteRow> {
         let query = self.inputs[5].read(cx).value().to_string();
-        let query = query.trim();
-        let candidate = query.to_uppercase();
-        let valid_key = candidate.rsplit_once('-').is_some_and(|(p, n)| {
+        let mut rows = Vec::new();
+        let commands: Vec<_> = crate::actions::COMMANDS
+            .iter()
+            .filter(|(_, label)| fuzzy(&query, label))
+            .map(|(key, label)| PaletteRow::Command(key, label))
+            .collect();
+        if !commands.is_empty() {
+            rows.push(PaletteRow::Heading("COMMANDS"));
+            rows.extend(commands);
+        }
+        let mut issues: Vec<_> = self
+            .store
+            .issues
+            .values()
+            .filter(|i| fuzzy(&query, &format!("{} {}", i.key, i.field("summary"))))
+            .collect();
+        issues.sort_by(|a, b| a.key.cmp(&b.key));
+        let candidate = query.trim().to_uppercase();
+        let uncached_key = candidate.rsplit_once('-').is_some_and(|(p, n)| {
             !p.is_empty()
                 && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && !n.is_empty()
                 && n.chars().all(|c| c.is_ascii_digit())
-        });
-        if valid_key {
-            self.palette = false;
-            self.open(candidate);
-            self.focus.focus(window, cx);
-            cx.notify();
-            return;
+        }) && !self.store.issues.contains_key(&candidate);
+        if !issues.is_empty() || uncached_key {
+            rows.push(PaletteRow::Heading("ISSUES"));
         }
-        if let Some((key, _)) = crate::actions::COMMANDS
+        if uncached_key {
+            rows.push(PaletteRow::Issue(candidate, "Open issue".into()));
+        }
+        rows.extend(
+            issues
+                .into_iter()
+                .take(30)
+                .map(|issue| PaletteRow::Issue(issue.key.clone(), issue.field("summary"))),
+        );
+        rows
+    }
+    fn reset_palette(&mut self, cx: &App) {
+        self.palette_selected = self
+            .palette_rows(cx)
             .iter()
-            .find(|(_, label)| fuzzy(query, label))
-        {
-            let key = key.to_string();
-            self.run_command(&key, window, cx);
-            return;
-        }
-        if let Some(issue) = self
-            .store
-            .issues
-            .values()
-            .find(|i| fuzzy(query, &format!("{} {}", i.key, i.field("summary"))))
-        {
-            let key = issue.key.clone();
-            self.palette = false;
-            self.open(key);
-            self.focus.focus(window, cx);
-            cx.notify();
+            .position(|row| !matches!(row, PaletteRow::Heading(_)))
+            .unwrap_or(0);
+        self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
+    fn palette_execute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.palette_rows(cx);
+        match rows.get(self.palette_selected) {
+            Some(PaletteRow::Command(key, _)) => self.run_command(key, window, cx),
+            Some(PaletteRow::Issue(key, _)) => {
+                let key = key.clone();
+                self.palette = false;
+                self.open(key);
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
+            _ => {}
         }
     }
 }
@@ -3473,66 +3533,72 @@ impl Render for AppView {
             body = body.items_center().justify_center().child(form);
         }
         if self.palette {
-            let query = self.inputs[5].read(cx).value().to_string();
-            let first = crate::actions::COMMANDS
-                .iter()
-                .position(|(_, label)| fuzzy(&query, label));
+            let rows = self.palette_rows(cx);
+            let count = rows.len();
+            let scroll = self.palette_scroll.clone();
             let results = div()
-                .id("palette")
-                .flex()
-                .flex_col()
-                .gap_1()
+                .relative()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .child(muted("COMMANDS"))
-                .children(
-                    crate::actions::COMMANDS
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, (_, label))| fuzzy(&query, label))
-                        .map(|(i, (key, label))| {
-                            let key = key.to_string();
-                            command_row(
-                                ("command", i),
-                                label.to_string(),
-                                key_name(&key),
-                                first == Some(i),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.run_command(&key, window, cx);
-                                    cx.notify();
-                                },
-                            ))
-                        }),
+                .child(
+                    uniform_list(
+                        "palette",
+                        count,
+                        cx.processor(
+                            move |this: &mut Self,
+                                  range: std::ops::Range<usize>,
+                                  _,
+                                  cx: &mut Context<Self>| {
+                                range
+                                    .map(|index| match &rows[index] {
+                                        PaletteRow::Heading(label) => div()
+                                            .h(px(36.))
+                                            .flex()
+                                            .items_center()
+                                            .pt_2()
+                                            .child(muted(*label))
+                                            .into_any_element(),
+                                        PaletteRow::Command(key, label) => {
+                                            let key = key.to_string();
+                                            command_row(
+                                                ("command", index),
+                                                label.to_string(),
+                                                key_name(&key),
+                                                this.palette_selected == index,
+                                                true,
+                                            )
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.run_command(&key, window, cx);
+                                                cx.notify();
+                                            }))
+                                            .into_any_element()
+                                        }
+                                        PaletteRow::Issue(key, label) => {
+                                            let key = key.clone();
+                                            command_row(
+                                                ("jump", index),
+                                                label.clone(),
+                                                key.clone(),
+                                                this.palette_selected == index,
+                                                false,
+                                            )
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.palette = false;
+                                                this.open(key.clone());
+                                                this.focus.focus(window, cx);
+                                                cx.notify();
+                                            }))
+                                            .into_any_element()
+                                        }
+                                    })
+                                    .collect()
+                            },
+                        ),
+                    )
+                    .track_scroll(&scroll)
+                    .size_full(),
                 )
-                .child(muted("ISSUES"))
-                .children(
-                    self.store
-                        .issues
-                        .values()
-                        .filter(|i| fuzzy(&query, &format!("{} {}", i.key, i.field("summary"))))
-                        .take(30)
-                        .enumerate()
-                        .map(|(i, issue)| {
-                            let key = issue.key.clone();
-                            command_row(
-                                ("jump", i),
-                                issue.field("summary"),
-                                key.clone(),
-                                first.is_none() && i == 0,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.palette = false;
-                                    this.open(key.clone());
-                                    this.focus.focus(window, cx);
-                                    cx.notify();
-                                },
-                            ))
-                        }),
-                );
+                .child(Scrollbar::vertical(&scroll).mode(ScrollbarMode::Always));
             body = div()
                 .flex()
                 .flex_col()
@@ -3772,19 +3838,22 @@ impl Render for AppView {
 
 fn key_name(key: &str) -> String {
     match key {
-        "enter" => "Enter".into(),
-        "escape" => "Esc".into(),
-        "delete" => "Delete".into(),
-        "ctrl-," => "Ctrl+,".into(),
-        "ctrl-shift-c" => "Ctrl+Shift+C".into(),
-        _ => key.to_uppercase(),
+        "escape" => "esc".into(),
+        _ => key.replace('-', "+"),
     }
 }
-fn command_row(id: impl Into<ElementId>, label: String, hint: String, selected: bool) -> Button {
+fn command_row(
+    id: impl Into<ElementId>,
+    label: String,
+    hint: String,
+    selected: bool,
+    shortcut: bool,
+) -> Button {
     Button::new(id)
         .ghost()
         .small()
-        .h(px(32.))
+        .h(px(36.))
+        .w_full()
         .rounded_none()
         .bg(rgb(if selected { 0x253348 } else { 0x20252e }))
         .border_l_2()
@@ -3796,8 +3865,27 @@ fn command_row(id: impl Into<ElementId>, label: String, hint: String, selected: 
                 .items_center()
                 .justify_between()
                 .w_full()
-                .child(label)
-                .child(keycap(hint)),
+                .pr_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .pr_4()
+                        .child(label),
+                )
+                .child(if shortcut {
+                    keycap(hint).flex_shrink_0()
+                } else {
+                    div()
+                        .flex_shrink_0()
+                        .font_family("JetBrains Mono")
+                        .text_size(px(11.))
+                        .text_color(rgb(0xc3ccdb))
+                        .child(hint)
+                }),
         )
 }
 
@@ -3880,6 +3968,7 @@ impl AppView {
                             s.set_value("", window, cx);
                             s.focus(window, cx);
                         });
+                        this.reset_palette(cx);
                     }
                     "palette-enter" => this.palette_execute(window, cx),
                     "save-edit" => this.save_edit(window, cx),

@@ -256,3 +256,16 @@ Dismiss key binding because it consumes Escape before raw key handlers.
 Native screenshots are `design/reviews/editor-escape-*.png`. Claude found no
 visual changes needed; its optional discard confirmation was not adopted because
 the requested behavior is single-Escape cancellation, matching the Cancel action.
+
+The command palette keeps its search input focused while Up/Down select matching
+commands and issues, skipping group headings. Reveal the selection only at a
+viewport edge with `ScrollStrategy::Nearest`; Enter executes that selected row.
+Changing the query or reopening the palette selects the first match. Keep issue
+ordering stable, hide empty group headings, and preserve direct issue-key lookup
+for uncached issues. Shortcut hints are lowercase; issue identifiers retain their
+case and use plain monospace text. Reserve a fixed scrollbar gutter and truncate
+long titles without shrinking identifiers.
+Native checks (2026-11-16) cover arrows across groups, both boundaries, scrolling,
+filter focus and reset, selected Enter execution, exact-key opening, empty results
+and minimum-width ellipsis. See `design/reviews/palette-*.png`. Claude's initial
+and follow-up reviews were completed; substantive layout findings were applied.
