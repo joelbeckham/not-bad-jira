@@ -11,6 +11,7 @@ gpui_kit::assets::icon_assets!(
         Equal,
         CircleDashed,
         CircleDot,
+        Clock,
         CircleCheck,
         CircleUserRound,
         Bug,

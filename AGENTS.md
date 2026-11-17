@@ -19,6 +19,15 @@ Claude should act as a read-only design critic. It should not modify application
 
 ## UI copy: no filler
 
+Waiting status icon (2026-11-16): exact `Waiting` names (case-insensitive,
+trimmed) use an amber clock, distinct from In Progress's blue circle-dot.
+Other statuses retain category-based fallbacks. The shared renderer applies to
+lists, details, related rows and pickers. Use `--demo --demo-statuses` for the
+comparison fixture. Release native list/detail captures are
+`design/reviews/waiting-status-list.png` and `waiting-status-detail.png`.
+Claude reviewed both and recommended no substantive changes. All 51 tests,
+Clippy with `-D warnings`, formatting and the release build pass.
+
 Apply this rule to all future UI changes, on every screen:
 
 - Keep copy concise and functional: headings, field labels, action names, status,

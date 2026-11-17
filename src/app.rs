@@ -2372,6 +2372,10 @@ impl AppView {
         let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("PLATFORM-12345","Review empty states","To Do","Lowest","Unassigned")].iter().enumerate().map(|(i,(key,summary,status,priority,assignee))|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"issuetype":{"name":(["Task","Story","Bug","Epic","Sub-task"][i]),"subtask":i==4},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.demo_related();
+        if std::env::args().any(|arg| arg == "--demo-statuses") {
+            self.store.issues.get_mut("NBJ-102").unwrap().fields["status"] =
+                json!({"name":"Waiting","statusCategory":{"key":"indeterminate"}});
+        }
         if std::env::args().any(|arg| arg == "--demo-rich-editor") {
             let issue = self.store.issues.get_mut("NBJ-101").unwrap();
             issue.fields["description"] = json!({"type":"doc","version":1,"content":[

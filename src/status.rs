@@ -4,7 +4,11 @@ use serde_json::Value;
 
 fn appearance(status: &Value) -> (String, IconName, u32) {
     let name = status["name"].as_str().unwrap_or("");
-    // The category handles custom workflow names without guessing their meaning.
+    // Waiting has a distinct meaning even within Jira's in-progress category.
+    if name.trim().eq_ignore_ascii_case("waiting") {
+        return (name.to_string(), IconName::Clock, 0xe8bd70);
+    }
+    // The category handles other custom workflow names without guessing their meaning.
     let category = status["statusCategory"]["key"].as_str().unwrap_or("");
     let category = if category.is_empty() {
         match name.to_ascii_lowercase().as_str() {
