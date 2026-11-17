@@ -59,6 +59,7 @@ impl Sender {
     }
 }
 pub struct AppView {
+    attachments: crate::attachments::Previews,
     avatars: crate::avatar::AvatarCache,
     focus: FocusHandle,
     config: Option<Config>,
@@ -66,6 +67,7 @@ pub struct AppView {
     store: Store,
     inputs: Vec<Entity<InputState>>,
     editor: Entity<zorite_editor::EditorState>,
+    rich_edit: bool,
     summary_input: Entity<InputState>,
     tab: usize,
     selected: usize,
@@ -138,12 +140,22 @@ impl AppView {
         .collect();
         let config = if preview { None } else { Config::load().ok() };
         let store = config.as_ref().map(Store::load).unwrap_or_default();
-        let editor = cx.new(|cx| zorite_editor::EditorState::new(window, cx));
+        let editor = cx.new(|cx| {
+            let mut editor = zorite_editor::EditorState::new(window, cx);
+            editor.set_markdown_style(editor_style(), cx);
+            editor.set_block_chip_provider(|source| {
+                source
+                    .strip_prefix("jira-media:")
+                    .map(|_| "Jira media".into())
+            });
+            editor
+        });
         let summary_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue summary"));
         let picker_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         let related_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter related issues"));
         let mut this = Self {
+            attachments: Default::default(),
             avatars: Default::default(),
             focus: cx.focus_handle(),
             config,
@@ -151,6 +163,7 @@ impl AppView {
             store,
             inputs,
             editor,
+            rich_edit: true,
             summary_input,
             tab: 0,
             selected: 0,
@@ -393,7 +406,7 @@ impl AppView {
         }
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
-        let mut changed = self.avatars.poll();
+        let mut changed = self.avatars.poll() | self.attachments.poll();
         if self
             .action_notice
             .as_ref()
@@ -1394,7 +1407,7 @@ impl AppView {
                     "picker-select",
                     cx,
                 ))
-                .child(self.shortcut_button("picker-close", &["Esc"], "Close", "escape", cx))
+                .child(self.shortcut_button("picker-close", &["esc"], "Close", "escape", cx))
         } else if self.related_navigation.is_some() && self.edit.is_none() {
             let selectable = self.related_navigation.as_ref().is_some_and(|navigation| {
                 self.store
@@ -1435,7 +1448,7 @@ impl AppView {
                 })
                 .child(self.shortcut_button(
                     "related-cancel",
-                    &["Esc"],
+                    &["esc"],
                     "Cancel",
                     "related-cancel",
                     cx,
@@ -1447,7 +1460,7 @@ impl AppView {
                 .child(
                     self.shortcut_button(
                         "footer-save",
-                        &["Ctrl+Enter"],
+                        &["ctrl+enter"],
                         if self
                             .edit
                             .as_ref()
@@ -1461,7 +1474,7 @@ impl AppView {
                         cx,
                     ),
                 )
-                .child(self.shortcut_button("footer-cancel", &["Esc"], "Cancel", "escape", cx))
+                .child(self.shortcut_button("footer-cancel", &["esc"], "Cancel", "escape", cx))
         } else {
             shortcuts
                 .child(
@@ -2359,6 +2372,19 @@ impl AppView {
         let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("PLATFORM-12345","Review empty states","To Do","Lowest","Unassigned")].iter().enumerate().map(|(i,(key,summary,status,priority,assignee))|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"issuetype":{"name":(["Task","Story","Bug","Epic","Sub-task"][i]),"subtask":i==4},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.demo_related();
+        if std::env::args().any(|arg| arg == "--demo-rich-editor") {
+            let issue = self.store.issues.get_mut("NBJ-101").unwrap();
+            issue.fields["description"] = json!({"type":"doc","version":1,"content":[
+                {"type":"heading","attrs":{"level":2},"content":[{"type":"text","text":"Release checklist"}]},
+                {"type":"paragraph","content":[{"type":"text","text":"Review the screenshots","marks":[{"type":"strong"}]}]},
+                {"type":"paragraph","content":[{"type":"text","text":"34.216.59.33"},{"type":"hardBreak"},{"type":"text","text":"54.69.240.210"}]},
+                {"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"demo-media","type":"file","collection":""}}]}
+            ]});
+            issue.fields["attachment"] = json!([
+                {"id":"1","filename":"jira.png","mimeType":"image/png"},
+                {"id":"2","filename":"release-notes.pdf","mimeType":"application/pdf"}
+            ]);
+        }
         if std::env::args().any(|arg| arg == "--demo-description") {
             self.store.issues.get_mut("NBJ-101").unwrap().fields["description"] = json!({
                 "type":"doc", "version":1, "content":[
@@ -3176,6 +3202,7 @@ impl Render for AppView {
                             }),
                         )
                         .children(self.render_related(&issue, window, cx))
+                        .children(self.render_attachments(&issue, cx))
                         .children(
                             issue.fields["comment"]["comments"]
                                 .as_array()
@@ -3645,7 +3672,11 @@ impl Render for AppView {
                     .overflow_y_scroll()
                     .p_4()
                     .bg(rgb(0x14171d))
-                    .font_family("JetBrains Mono")
+                    .font_family(if self.rich_edit {
+                        "Inter"
+                    } else {
+                        "JetBrains Mono"
+                    })
                     .text_size(px(14.))
                     .border_1()
                     .border_color(rgb(
@@ -3672,7 +3703,54 @@ impl Render for AppView {
                     } else {
                         format!("{key} / Edit {kind}")
                     }))
+                    .when(!single, |body| {
+                        body.child(div().flex().children(
+                            [(true, "Rich"), (false, "Markdown")].into_iter().map(
+                                |(rich, label)| {
+                                    Button::new(label)
+                                        .small()
+                                        .label(label)
+                                        .when(self.rich_edit == rich, |button| button.primary())
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_none()
+                                        .border_1()
+                                        .border_color(rgb(if self.rich_edit == rich {
+                                            0x79aaf9
+                                        } else {
+                                            0x394352
+                                        }))
+                                        .bg(rgb(if self.rich_edit == rich {
+                                            0x315481
+                                        } else {
+                                            0x20252e
+                                        }))
+                                        .disabled(self.saving)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.rich_edit = rich;
+                                            this.editor.update(cx, |editor, cx| {
+                                                if rich {
+                                                    editor.set_markdown_style(editor_style(), cx);
+                                                } else {
+                                                    editor.clear_markdown_style(cx);
+                                                }
+                                                editor.focus(window, cx);
+                                            });
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }))
+                                },
+                            ),
+                        ))
+                    })
                     .child(editor_area)
+                    .children(
+                        (!single
+                            && (document.markdown.contains("[ADF:")
+                                || document.markdown.contains("jira-media:")))
+                        .then(|| {
+                            muted("Keep protected content and Jira media references unchanged.")
+                        }),
+                    )
                     .children(self.create_error.as_ref().filter(|_| kind == "create").map(
                         |error| {
                             div()
@@ -3681,10 +3759,6 @@ impl Render for AppView {
                                 .child(error.clone())
                         },
                     ))
-                    .children(
-                        (!single && document.markdown.contains("[ADF:"))
-                            .then(|| muted("Leave [ADF:n] markers unchanged.")),
-                    )
                     .child(
                         div()
                             .flex()
@@ -3729,6 +3803,12 @@ impl Render for AppView {
                                         cx.notify();
                                     })),
                             ),
+                    )
+                    .children(
+                        (!single)
+                            .then(|| self.store.issues.get(key))
+                            .flatten()
+                            .and_then(|issue| self.render_attachments(issue, cx)),
                     );
         } else if let Some(picker) = &self.picker
             && picker.kind == "delete"
@@ -3998,5 +4078,175 @@ impl AppView {
                 }
                 cx.notify();
             }))
+    }
+}
+
+fn editor_style() -> zorite_editor::SyntaxStyle {
+    zorite_editor::SyntaxStyle {
+        marker: rgb(0x95a3b8).into(),
+        code: rgb(0xe6ebf3).into(),
+        code_bg: rgb(0x20252e).into(),
+        link: rgb(0x79aaf9).into(),
+        tag: rgb(0x79aaf9).into(),
+        quote: rgb(0x95a3b8).into(),
+        alert_note: rgb(0x79aaf9).into(),
+        alert_tip: rgb(0x86cba3).into(),
+        alert_important: rgb(0xc594ef).into(),
+        alert_warning: rgb(0xe8b66a).into(),
+        alert_caution: rgb(0xf07b84).into(),
+        alert_icons: None,
+        rule: rgb(0x394352).into(),
+        mark_bg: rgb(0x665728).into(),
+        block_label: None,
+        block_label_gen: 0,
+        block_ref_count: None,
+        popover_bg: rgb(0x20252e).into(),
+        popover_border: rgb(0x394352).into(),
+        popover_fg: rgb(0xe6ebf3).into(),
+        popover_hover: rgb(0x253348).into(),
+        popover_divider: rgb(0x394352).into(),
+        popover_danger: rgb(0xf07b84).into(),
+        mono: font("JetBrains Mono"),
+        property_icon: None,
+    }
+}
+
+impl AppView {
+    fn render_attachments(&self, issue: &Issue, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let files = issue.fields["attachment"]
+            .as_array()
+            .filter(|files| !files.is_empty())?;
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(muted("ATTACHMENTS"))
+                .child(
+                    div()
+                        .id("attachment-previews")
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_wrap()
+                        .gap_3()
+                        .children(files.iter().enumerate().map(|(index, file)| {
+                            let name = file["filename"]
+                                .as_str()
+                                .unwrap_or("Attachment")
+                                .to_string();
+                            let id = file["id"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| file["id"].to_string());
+                            let image = file["mimeType"]
+                                .as_str()
+                                .is_some_and(|mime| mime.starts_with("image/"));
+                            let preview = if self.demo && image && id == "1" {
+                                Some(Ok(std::sync::Arc::new(Image::from_bytes(
+                                    ImageFormat::Png,
+                                    include_bytes!("../assets/jira.png").to_vec(),
+                                ))))
+                            } else if image && !self.demo {
+                                self.client
+                                    .as_ref()
+                                    .and_then(|client| self.attachments.get(client, &id))
+                            } else {
+                                None
+                            };
+                            let address = self.config.as_ref().map(|config| {
+                                format!("{}/secure/attachment/{}/", config.jira.base_url, id)
+                            });
+                            div()
+                                .w(px(200.))
+                                .flex_shrink_0()
+                                .p_2()
+                                .gap_2()
+                                .flex()
+                                .flex_col()
+                                .border_1()
+                                .border_color(rgb(0x394352))
+                                .rounded_md()
+                                .when(!image, |card| {
+                                    card.child(
+                                        div()
+                                            .h(px(100.))
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                gpui_kit::component::Icon::new(
+                                                    gpui_kit::assets::IconName::File,
+                                                )
+                                                .size(px(40.))
+                                                .text_color(rgb(0x95a3b8)),
+                                            )
+                                            .child(muted("FILE")),
+                                    )
+                                })
+                                .when(image, |card| {
+                                    card.child(match preview {
+                                        Some(Ok(image)) => div()
+                                            .h(px(100.))
+                                            .flex_shrink_0()
+                                            .overflow_hidden()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                img(image)
+                                                    .size(px(80.))
+                                                    .object_fit(ObjectFit::Contain),
+                                            )
+                                            .into_any_element(),
+                                        Some(Err(error)) => muted(error).into_any_element(),
+                                        None => muted(if self.demo {
+                                            "Image attachment"
+                                        } else if self.client.is_none() {
+                                            "Connect to preview"
+                                        } else {
+                                            "Loading preview..."
+                                        })
+                                        .into_any_element(),
+                                    })
+                                })
+                                .child(
+                                    Button::new(("attachment", index))
+                                        .ghost()
+                                        .small()
+                                        .flex_shrink_0()
+                                        .accessibility_label(format!("Open {name}"))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(name),
+                                        )
+                                        .disabled(
+                                            address.is_none()
+                                                || !id.chars().all(|c| c.is_ascii_digit()),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if this.demo {
+                                                cx.stop_propagation();
+                                                return;
+                                            }
+                                            if let Some(address) = &address {
+                                                cx.open_url(address);
+                                                this.show_notice("Opening attachment", false);
+                                            }
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        })),
+                                )
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 }

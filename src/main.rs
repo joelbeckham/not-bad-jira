@@ -4,6 +4,7 @@ use gpui_kit::*;
 mod actions;
 mod adf;
 mod app;
+mod attachments;
 mod avatar;
 mod config;
 mod indicator;

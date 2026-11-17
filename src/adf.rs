@@ -125,7 +125,14 @@ impl Document {
     fn protect(&mut self, v: &Value) -> String {
         let i = self.protected.len();
         self.protected.push(v.clone());
-        format!("[ADF:{i}]")
+        if matches!(
+            v["type"].as_str(),
+            Some("mediaSingle" | "mediaGroup" | "media")
+        ) {
+            format!("![Jira media](jira-media:{i})\n\n")
+        } else {
+            format!("[ADF:{i}]")
+        }
     }
     fn render(&mut self, v: &Value) -> String {
         let kind = v["type"].as_str().unwrap_or("");
@@ -184,7 +191,10 @@ impl Document {
                     let after = raw[i + c.len_utf8()..].chars().next();
                     let literal = match c {
                         ':' | '/' | ';' | ',' | '@' | '$' | '%' | '^' | '?' | '{' | '}' => true,
-                        '.' => before.is_some_and(|c| !c.is_ascii_digit()),
+                        '.' => {
+                            after.is_some_and(|c| !c.is_whitespace())
+                                || before.is_some_and(|c| !c.is_ascii_digit())
+                        }
                         '-' => {
                             before.is_some_and(char::is_alphanumeric)
                                 && after.is_some_and(char::is_alphanumeric)
@@ -340,6 +350,19 @@ impl Document {
         }
     }
     pub fn to_adf(&self, markdown: &str) -> Result<Value> {
+        let mut normalized = markdown.to_string();
+        for (i, node) in self.protected.iter().enumerate() {
+            if matches!(
+                node["type"].as_str(),
+                Some("mediaSingle" | "mediaGroup" | "media")
+            ) {
+                normalized = normalized.replace(
+                    &format!("![Jira media](jira-media:{i})"),
+                    &format!("[ADF:{i}]"),
+                );
+            }
+        }
+        let markdown = normalized.as_str();
         for i in 0..self.protected.len() {
             if markdown.matches(&format!("[ADF:{i}]")).count() != 1 {
                 bail!(
@@ -515,6 +538,26 @@ fn restore(v: &mut Value, protected: &[Value]) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn jira_media_survives_text_edits_and_rejects_missing_tokens() {
+        for node in [
+            json!({"type":"mediaSingle","attrs":{"layout":"center","width":80},"content":[{"type":"media","attrs":{"id":"uuid-image","type":"file","collection":"jira","width":800,"height":600}}]}),
+            json!({"type":"mediaGroup","content":[{"type":"media","attrs":{"id":"uuid-pdf","type":"file","collection":"jira"}}]}),
+        ] {
+            let original = json!({"type":"doc","version":1,"content":[node]});
+            let doc = Document::from_adf(&original);
+            assert_eq!(doc.to_adf(&doc.markdown).unwrap(), original);
+            let edited = doc
+                .to_adf(&format!("Changed text\n\n{}", doc.markdown))
+                .unwrap();
+            assert_eq!(edited["content"][1], original["content"][0]);
+            assert!(doc.to_adf("").is_err());
+            assert!(
+                doc.to_adf(&format!("{}\n\n{}", doc.markdown, doc.markdown))
+                    .is_err()
+            );
+        }
+    }
+    #[test]
     fn entered_lines_survive_save_and_reopen() {
         let input = "34.216.59.33\n54.69.240.210\n35.90.42.16\n52.27.217.135\n34.215.163.132";
         let saved = Document::default().to_adf(input).unwrap();
@@ -528,6 +571,7 @@ mod tests {
             4
         );
         let reopened = Document::from_adf(&saved);
+        assert!(!reopened.markdown.contains("\\."));
         assert!(!reopened.markdown.contains("[ADF:"));
         assert_eq!(reopened.to_adf(&reopened.markdown).unwrap(), saved);
         let legacy = json!({"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":input}]}]});

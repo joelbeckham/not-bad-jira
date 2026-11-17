@@ -278,3 +278,24 @@ defocus/refocus on text, padding and blank space, subsequent typing, and Escape
 cancellation followed by reopening the original description. Screenshots are
 `design/reviews/editor-refocus-*.png`. Claude reviewed the focus states and found
 no visual changes necessary. All 47 tests and Clippy pass.
+
+Rich editor and attachments (2026-11-16): description/comment editors use Zorite's
+native Markdown styling with a Rich / Markdown toggle sharing one buffer. Switching
+must preserve the draft, selection and undo history. Jira media nodes use protected
+`![Jira media](jira-media:N)` references, shown as chips in Rich mode; conversion
+restores the original ADF and rejects missing or duplicated references. Other unknown
+ADF stays protected. Existing attachments appear below descriptions and editors,
+with bounded image previews and browser links. Media Services UUIDs are not Jira
+attachment IDs: do not guess inline attachment mappings. Upload/paste of new files
+is not implemented. Image fetching uses a bounded worker queue, account-specific
+memory entries, size-limited decoding and redirects without cross-origin credentials.
+Use `--demo --demo-rich-editor` for the native preview fixture.
+Native checks cover both mode states, draft retention across toggles, readable IP
+lines, media chips, contained previews and matching file cards. Screenshots:
+`design/reviews/rich-editor.png`, `raw-editor.png`, `editor-toggle-draft.png`.
+Both Claude design reviews completed; substantive active-state, card and form
+layout findings were applied. Final validation: 51 tests pass; Clippy passes with
+`-D warnings`. Attachment HTTP fixtures cover the canonical endpoint and invalid
+IDs; shared redirect tests cover credential isolation. Live authenticated attachment
+downloads and Jira writes were not performed.
+The final release build was launched and checked natively; see design/reviews/rich-editor-release.png. The existing user process was preserved.

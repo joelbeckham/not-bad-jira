@@ -76,6 +76,18 @@ impl Client {
     }
 
     pub fn avatar_bytes(&self, address: &str) -> Result<Vec<u8>> {
+        self.image_bytes(address, 1024 * 1024)
+    }
+    pub fn attachment_preview(&self, id: &str) -> Result<Vec<u8>> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+            bail!("Invalid attachment ID");
+        }
+        self.image_bytes(
+            &self.url(&format!("attachment/content/{id}")),
+            8 * 1024 * 1024,
+        )
+    }
+    fn image_bytes(&self, address: &str, limit: u64) -> Result<Vec<u8>> {
         let site = url::Url::parse(&self.config.jira.base_url)?;
         let mut address = url::Url::parse(address)?;
         // Resolve redirects explicitly: a Jira avatar can redirect to a public
@@ -114,7 +126,7 @@ impl Client {
             return Ok(response
                 .body_mut()
                 .with_config()
-                .limit(1024 * 1024)
+                .limit(limit)
                 .read_to_vec()?);
         }
         bail!("Too many avatar redirects")
@@ -370,6 +382,28 @@ mod tests {
                 .is_null()
         );
         server.join().unwrap();
+    }
+    #[test]
+    fn attachment_download_uses_validated_site_endpoint() {
+        let (url, server) = mock(vec![(200, json!("image fixture"))]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        for id in [
+            "",
+            "../other",
+            "https://other.example/file",
+            "12?redirect=1",
+        ] {
+            assert!(client.attachment_preview(id).is_err());
+        }
+        assert!(!client.attachment_preview("123").unwrap().is_empty());
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests[0]["request"],
+            "GET /rest/api/3/attachment/content/123 HTTP/1.1"
+        );
     }
 
     #[test]
