@@ -15,6 +15,7 @@ mod priority;
 mod related;
 mod status;
 mod store;
+mod tabs;
 mod wheel;
 fn main() {
     let started = std::time::Instant::now();

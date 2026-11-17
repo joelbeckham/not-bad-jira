@@ -2,14 +2,14 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Config {
     pub jira: Jira,
     pub tabs: Vec<Tab>,
     #[serde(default = "ttl")]
     pub cache_ttl: String,
 }
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Jira {
     pub base_url: String,
     #[serde(default)]
@@ -17,7 +17,7 @@ pub struct Jira {
     #[serde(default)]
     pub default_project: String,
 }
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Tab {
     pub label: String,
     #[serde(default)]
@@ -66,11 +66,8 @@ impl Config {
         if !self.jira.email.contains('@') {
             bail!("Enter your Jira account email");
         }
-        if self.tabs.is_empty() {
-            bail!("Configure at least one tab");
-        }
         for t in &self.tabs {
-            if t.label.is_empty() || t.jql.is_empty() == t.filter_id.is_empty() {
+            if t.label.trim().is_empty() || t.jql.trim().is_empty() == t.filter_id.is_empty() {
                 bail!("Each tab needs a label and exactly one of jql or filter_id");
             }
             if t.columns.is_empty()
@@ -91,10 +88,25 @@ impl Config {
         Ok(())
     }
     pub fn save(&self) -> Result<()> {
+        self.save_to(&path())
+    }
+    pub fn save_tabs(&self, expected: &Self) -> Result<()> {
+        self.save_tabs_to(expected, &path())
+    }
+    fn save_tabs_to(&self, expected: &Self, p: &std::path::Path) -> Result<()> {
+        let current: Self = serde_norway::from_str(&std::fs::read_to_string(p)?)?;
+        anyhow::ensure!(
+            &current == expected,
+            "Config changed on disk. Close tab editing and try again after reload."
+        );
+        self.save_to(p)
+    }
+    fn save_to(&self, p: &std::path::Path) -> Result<()> {
         self.validate()?;
-        let p = path();
         std::fs::create_dir_all(p.parent().unwrap())?;
-        std::fs::write(p, serde_norway::to_string(self)?)?;
+        let tmp = p.with_extension("tmp");
+        std::fs::write(&tmp, serde_norway::to_string(self)?)?;
+        std::fs::rename(tmp, p)?;
         Ok(())
     }
     pub fn ttl_seconds(&self) -> Result<u64> {
@@ -145,6 +157,35 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tab_saves_replace_atomically_and_reject_external_edits() {
+        let p = std::env::temp_dir().join(format!(
+            "nbj-tab-config-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original = Config::initial(
+            "https://example.atlassian.net".into(),
+            "test@example.com".into(),
+            "T".into(),
+        );
+        original.save_to(&p).unwrap();
+        let mut next = original.clone();
+        next.tabs
+            .push(Tab::with_query("Epic".into(), "parent = \"T-123\"".into()));
+        next.save_tabs_to(&original, &p).unwrap();
+        let restored: Config =
+            serde_norway::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(restored, next);
+        let before = std::fs::read(&p).unwrap();
+        assert!(original.save_tabs_to(&original, &p).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert!(!p.with_extension("tmp").exists());
+        std::fs::remove_file(p).unwrap();
+    }
     #[test]
     fn accepts_due_tab_after_config_roundtrip() {
         let mut config = Config::initial(

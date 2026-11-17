@@ -19,6 +19,10 @@ use gpui_kit::*;
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc, time::Duration};
 
+#[path = "tab_ui.rs"]
+mod tab_ui;
+use tab_ui::{TabEditor, TabSave};
+
 type FieldBounds = Rc<RefCell<HashMap<(String, String), Bounds<Pixels>>>>;
 
 struct RelatedView {
@@ -47,6 +51,8 @@ enum Message {
     Created(u64, Result<CreatedIssue, String>),
     Choices(u64, Result<Vec<Choice>, String>),
     Related(u64, String, u64, Result<Vec<Issue>, String>),
+    TabPreview(u64, Result<(Vec<Issue>, bool), String>),
+    TabsSaved(Result<(), String>),
 }
 #[derive(Clone)]
 struct Sender {
@@ -70,6 +76,15 @@ pub struct AppView {
     rich_edit: bool,
     summary_input: Entity<InputState>,
     tab: usize,
+    tab_editor: Option<TabEditor>,
+    tab_name: Entity<InputState>,
+    tab_jql: Entity<gpui_kit::component::input::TextareaState>,
+    tab_save: Option<TabSave>,
+    tab_generation: u64,
+    tab_preview_request: u64,
+    tab_refocus: bool,
+    tab_strip_scroll: ScrollHandle,
+    tab_strip_selection: std::cell::Cell<(usize, u64)>,
     selected: usize,
     stack: Vec<String>,
     status: String,
@@ -166,6 +181,15 @@ impl AppView {
             rich_edit: true,
             summary_input,
             tab: 0,
+            tab_editor: None,
+            tab_name: cx.new(|cx| InputState::new(window, cx)),
+            tab_jql: cx.new(|cx| gpui_kit::component::input::TextareaState::new(window, cx)),
+            tab_save: None,
+            tab_generation: 0,
+            tab_preview_request: 0,
+            tab_refocus: false,
+            tab_strip_scroll: ScrollHandle::new(),
+            tab_strip_selection: std::cell::Cell::new((usize::MAX, 0)),
             selected: 0,
             stack: Vec::new(),
             status: String::new(),
@@ -256,6 +280,25 @@ impl AppView {
         });
         this.subscriptions
             .push(cx.observe(&this.inputs[4], |_, _, cx| cx.notify()));
+        this.subscriptions
+            .push(cx.observe(&this.tab_name, |_, _, cx| cx.notify()));
+        this.subscriptions
+            .push(cx.observe(&this.tab_jql, |_, _, cx| cx.notify()));
+        this.subscriptions.push(cx.subscribe_in(
+            &this.tab_jql,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.tab_preview_request += 1;
+                    if let Some(editor) = this.tab_editor.as_mut() {
+                        editor.preview = None;
+                        editor.preview_loading = false;
+                        editor.preview_error = None;
+                    }
+                    cx.notify();
+                }
+            },
+        ));
         this.subscriptions.push(cx.subscribe_in(
             &this.inputs[4],
             window,
@@ -393,7 +436,12 @@ impl AppView {
             self.refresh_errors.clear();
             self.last_refresh = std::time::Instant::now();
             self.loading = client.config.tabs.len();
-            self.status = "Refreshing issues…".into();
+            self.status = if self.loading == 0 {
+                "No tabs"
+            } else {
+                "Refreshing issues…"
+            }
+            .into();
             for index in 0..self.loading {
                 let client = client.clone();
                 let tx = self.tx.clone();
@@ -422,14 +470,29 @@ impl AppView {
             changed = true;
             match message {
                 Message::ConfigChanged(Ok(c)) => {
-                    if !self.demo {
+                    if !self.demo && self.config.as_ref() != Some(&c) {
                         self.pending_config = Some(c);
                     }
                 }
                 Message::ConfigChanged(Err(e)) => {
+                    if self.demo {
+                        continue;
+                    }
                     self.action_notice = None;
                     self.status = format!("Config reload failed: {e}")
                 }
+                Message::TabPreview(request, result) => {
+                    if request == self.tab_preview_request
+                        && let Some(editor) = self.tab_editor.as_mut()
+                    {
+                        editor.preview_loading = false;
+                        match result {
+                            Ok(preview) => editor.preview = Some(preview),
+                            Err(error) => editor.preview_error = Some(error),
+                        }
+                    }
+                }
+                Message::TabsSaved(result) => self.finish_tab_save(result, cx),
                 Message::Connected(Ok((client, user))) => {
                     self.connecting = false;
                     self.current_user = Some(user.clone());
@@ -537,7 +600,9 @@ impl AppView {
                             self.status = format!("Created {key}");
                             self.show_notice(format!("Created {key}"), true);
                             if self.demo {
-                                self.store.tabs[self.tab].insert(0, key);
+                                if let Some(tab) = self.store.tabs.get_mut(self.tab) {
+                                    tab.insert(0, key);
+                                }
                             } else {
                                 self.refresh();
                                 if let Some(config) = &self.config {
@@ -663,10 +728,14 @@ impl AppView {
             && !self.saving
             && self.edit.is_none()
             && self.picker.is_none()
+            && self.tab_editor.is_none()
+            && self.tab_save.is_none()
             && !self.connecting
             && let Some(c) = self.pending_config.take()
         {
             self.store = Store::load(&c);
+            self.tab_generation += 1;
+            self.sort.clear();
             self.client = None;
             self.config = Some(c);
             self.tab = 0;
@@ -1066,7 +1135,7 @@ impl AppView {
     }
 
     fn choose_for(&mut self, kind: &str, key: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving {
+        if self.saving || self.tab_save.is_some() {
             return;
         }
         if !self.demo && self.client.is_none() {
@@ -1304,6 +1373,20 @@ impl AppView {
     }
 
     fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_editor.is_some() {
+            if event.keystroke.key == "escape" {
+                if self.tab_save.is_none() {
+                    self.close_tab_editor(window, cx);
+                }
+            } else if event.keystroke.key == "enter" && event.keystroke.modifiers.control {
+                self.save_tab_editor(cx);
+            } else {
+                return;
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if self.palette && matches!(event.keystroke.key.as_str(), "up" | "down") {
             let rows = self.palette_rows(cx);
             let indices: Vec<_> = rows
@@ -1371,6 +1454,25 @@ impl AppView {
     }
     fn render_shortcuts(&self, cx: &mut Context<Self>) -> Div {
         let shortcuts = div().flex().items_center().gap_4().flex_shrink_0();
+        if self.tab_editor.is_some() {
+            return shortcuts
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(keycap("ctrl+enter"))
+                        .child(muted("Save")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(keycap("esc"))
+                        .child(muted("Cancel")),
+                );
+        }
         if self.create_pending.is_some() {
             return shortcuts;
         }
@@ -2026,6 +2128,8 @@ impl AppView {
             ));
         }
         content = content.child(priority);
+        let context_issue = issue.clone();
+        let weak = cx.entity().downgrade();
         Button::new(SharedString::from(id))
             .ghost()
             .tab_stop(false)
@@ -2044,6 +2148,16 @@ impl AppView {
                 this.focus.focus(window, cx);
                 cx.notify();
             }))
+            .map(|row| {
+                if crate::tabs::is_epic(issue) {
+                    row.context_menu(move |menu, _, _| {
+                        Self::epic_menu(menu, weak.clone(), context_issue.clone())
+                    })
+                    .into_any_element()
+                } else {
+                    row.into_any_element()
+                }
+            })
             .into_any_element()
     }
 
@@ -2512,6 +2626,9 @@ impl AppView {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_editor.is_some() || self.tab_save.is_some() {
+            return;
+        }
         if self.create_pending.is_some() {
             return;
         }
@@ -2569,6 +2686,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.tab_editor.is_some() || self.tab_save.is_some() {
+            // Let unhandled workspace bindings become text in the tab inputs.
+            // Returning without propagation consumes letters such as a, e and r.
+            cx.propagate();
+            return;
+        }
         if action.key == "cancel-edit" && self.edit.is_some() && self.picker.is_none() {
             if !self.saving && self.create_pending.is_none() {
                 self.edit = None;
@@ -2584,6 +2707,9 @@ impl AppView {
         self.run_command(&action.key, window, cx);
     }
     fn run_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_editor.is_some() || self.tab_save.is_some() {
+            return;
+        }
         self.list_wheel = crate::wheel::RowWheel::default();
         self.palette = false;
         self.related_navigation = None;
@@ -3002,39 +3128,7 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut body = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
         if let Some(c) = &self.config {
-            let tabs = div()
-                .flex()
-                .items_center()
-                .h(px(40.))
-                .flex_shrink_0()
-                .px_6()
-                .gap_6()
-                .border_b_1()
-                .border_color(rgb(0x2b303b))
-                .children(c.tabs.iter().enumerate().map(|(i, t)| {
-                    div()
-                        .id(("tab", i))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .border_b_2()
-                        .border_color(rgb(if i == self.tab { 0x79aaf9 } else { 0x191c23 }))
-                        .text_color(rgb(if i == self.tab { 0xf0f3f9 } else { 0x929cad }))
-                        .cursor_pointer()
-                        .child(t.label.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.tab = i;
-                            this.selected = 0;
-                            this.stack.clear();
-                            this.detail_offsets.clear();
-                            this.related_views.borrow_mut().clear();
-                            this.related_navigation = None;
-                            this.related_pending.clear();
-                            this.related_errors.clear();
-                            cx.notify();
-                        }))
-                }));
-            body = body.child(tabs);
+            body = body.child(self.render_tabs(cx));
             if self
                 .related_navigation
                 .as_ref()
@@ -3145,7 +3239,23 @@ impl Render for AppView {
                                                                     .build(window, cx)
                                                             }
                                                         })
-                                                        .child(issue.field("summary")),
+                                                        .child(issue.field("summary"))
+                                                        .map(|title| {
+                                                            if !crate::tabs::is_epic(&issue) {
+                                                                return title.into_any_element();
+                                                            }
+                                                            let weak = cx.entity().downgrade();
+                                                            let issue = issue.clone();
+                                                            title
+                                                                .context_menu(move |menu, _, _| {
+                                                                    Self::epic_menu(
+                                                                        menu,
+                                                                        weak.clone(),
+                                                                        issue.clone(),
+                                                                    )
+                                                                })
+                                                                .into_any_element()
+                                                        }),
                                                 ),
                                         ),
                                 )
@@ -3239,7 +3349,11 @@ impl Render for AppView {
             } else {
                 let keys = self.keys(cx);
                 let count = keys.len();
-                let columns = c.tabs[self.tab].columns.clone();
+                let columns = c
+                    .tabs
+                    .get(self.tab)
+                    .map(|t| t.columns.clone())
+                    .unwrap_or_default();
                 body = body
                     .child(
                         div()
@@ -3312,6 +3426,7 @@ impl Render for AppView {
                                             let selected = i == this.selected;
                                             let key = issue.key.clone();
                                             let context_key = key.clone();
+                                            let context_issue = issue.clone();
                                             let weak = cx.entity().downgrade();
                                             div()
                                                 .id(("issue", i))
@@ -3457,6 +3572,9 @@ impl Render for AppView {
                                                     });
                                                     menu = menu.min_w(px(240.));
                                                     for (command, label) in crate::actions::issue_commands() {
+                                                        if command == "delete" {
+                                                            menu = Self::epic_menu(menu, weak.clone(), context_issue.clone());
+                                                        }
                                                         if matches!(command, "s" | "y" | "delete") {
                                                             menu = menu.separator();
                                                         }
@@ -3563,7 +3681,26 @@ impl Render for AppView {
                 );
             body = body.items_center().justify_center().child(form);
         }
-        if self.palette {
+        if self.tab_editor.is_some() {
+            body = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_tab_editor(window, cx));
+        } else if self.config.as_ref().is_some_and(|c| c.tabs.is_empty())
+            && self.stack.is_empty()
+            && self.edit.is_none()
+            && self.picker.is_none()
+            && !self.palette
+        {
+            body = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .child(self.render_tabs(cx))
+                .child(self.new_tab_button(cx));
+        } else if self.palette {
             let rows = self.palette_rows(cx);
             let count = rows.len();
             let scroll = self.palette_scroll.clone();
@@ -3840,6 +3977,11 @@ impl Render for AppView {
                             cx.listener(|this, _, window, cx| this.select_picker(window, cx)),
                         ),
                 );
+        }
+        if self.tab_refocus {
+            self.tab_refocus = false;
+            self.inputs[4].update(cx, |input, cx| input.set_value("", window, cx));
+            self.focus.focus(window, cx);
         }
         let shortcuts = self.render_shortcuts(cx);
         if self.create_refocus {

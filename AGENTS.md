@@ -308,3 +308,48 @@ layout findings were applied. Final validation: 51 tests pass; Clippy passes wit
 IDs; shared redirect tests cover credential isolation. Live authenticated attachment
 downloads and Jira writes were not performed.
 The final release build was launched and checked natively; see design/reviews/rich-editor-release.png. The existing user process was preserved.
+
+Tab management (2026-11-16): right-click tabs to edit, rename, duplicate or delete;
+right-click empty tab-strip space to create a tab. Editing has Name and multiline
+JQL fields, an explicit Run preview (up to 50 issues), Save and Cancel. Query
+changes immediately invalidate the preview; request IDs and account epochs
+discard late replies. Escape cancels; Ctrl+Enter saves before the text input can
+insert a newline. Keep Save/Cancel below the bounded preview and use the existing
+footer for shortcuts/notices. Tab labels truncate and the strip reveals the active
+tab when it changes. Deleting the last tab is supported, with a New tab action in
+the empty view.
+Epic context menus in lists, related rows and detail headings offer Turn into tab.
+The tab is named with the epic key and queries `parent = "KEY" ORDER BY Rank ASC`;
+it includes direct children, not unrelated links or grandchildren. Recognize epics
+by hierarchyLevel 1 or the Epic type name. Demo operations stay in memory.
+`src/tabs.rs` handles tab mutations, query construction and row remapping;
+`src/tab_ui.rs` is an app submodule for the UI and workers. Tab writes compare the
+loaded config before atomic replacement and only apply in-memory changes after
+success. Preserve drafts on failure, filter-backed settings when unchanged,
+columns and sort settings when duplicating, and response revision guards during
+concurrent refresh. Ignore the config watcher's echo of our own writes.
+Native checks cover all tab actions, epic conversion from list/detail/related
+views, deleting all tabs and creating again, preview invalidation/empty/error
+states, keyboard cancellation/save, minimum size, preview scrolling and overflow
+tab reveal. Screenshots are `design/reviews/tab-*.png`, including `tab-release.png`.
+Both Claude visual reviews completed; substantive findings were applied and the
+follow-up found no remaining visual issues. HTTP fixtures cover preview bounds
+and Jira errors; config tests cover replacement and rejecting external edits.
+Authenticated JQL previews were not run against a live Jira account.
+Validation: 57 tests pass, Clippy passes for all targets with `-D warnings`, and
+formatting passes. Ctrl+Enter was checked with the caret inside a JQL token and
+preserved the query exactly. The Windows executable reserves 8 MiB of UI-thread
+stack address space to accommodate nested GPUI forms in debug builds.
+The final release build passed and was launched; epic conversion, preview and
+Ctrl+Enter save passed again in that executable (`design/reviews/tab-release.png`).
+
+Tab text-input hotkeys (2026-11-16): the workspace Command handler must propagate
+unhandled actions while a tab editor is open. A bare early return consumes bound
+letters before the input can type them. Keep the form's explicit Save/Cancel
+handling. `scripts/check-tab-typing.ps1 -TargetProcessId <demo-pid>` posts real
+alphabet, digit and slash keystrokes to Rename, Edit and New tab fields and checks
+Ctrl+Enter save plus Escape cancellation. Setting UIA values alone cannot verify
+this regression. Native captures are `design/reviews/tab-typing-rename.png` and
+`tab-typing-edit.png`. All 57 tests, Clippy and formatting pass.
+Claude reviewed the typing/focus screenshots and found no visual changes needed.
+The same real-keystroke regression check passed in the final release executable.

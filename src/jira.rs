@@ -206,6 +206,21 @@ impl Client {
         self.search_jql(&crate::related::query(issue)?)
     }
 
+    pub fn preview_jql(&self, jql: &str) -> Result<(Vec<Issue>, bool)> {
+        let data = self.send(
+            "POST",
+            "search/jql",
+            json!({
+                "jql": jql, "maxResults": 50,
+                "fields": ["summary", "status", "issuetype"]
+            }),
+        )?;
+        let issues = serde_json::from_value(data["issues"].clone())?;
+        let more =
+            data["isLast"].as_bool() != Some(true) && data["nextPageToken"].as_str().is_some();
+        Ok((issues, more))
+    }
+
     fn search_jql(&self, jql: &str) -> Result<Vec<Issue>> {
         let mut issues = Vec::new();
         let mut token = Value::Null;
@@ -343,6 +358,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn jql_preview_is_bounded_and_reports_more_results() {
+        let (url, server) = mock(vec![(
+            200,
+            json!({"issues":[{"key":"T-1","fields":{"summary":"One"}}],"nextPageToken":"next","isLast":false}),
+        )]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        let (issues, more) = client.preview_jql("parent = \"T-10\"").unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(more);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["body"]["jql"], "parent = \"T-10\"");
+        assert_eq!(requests[0]["body"]["maxResults"], 50);
+    }
+    #[test]
+    fn jql_preview_preserves_jira_validation_errors() {
+        let (url, server) = mock(vec![(400, json!({"errorMessages":["Invalid JQL"]}))]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        assert!(
+            client
+                .preview_jql("invalid")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Invalid JQL")
+        );
+        server.join().unwrap();
+    }
     #[test]
     fn search_uses_token_pagination() {
         let (url, server) = mock(vec![
