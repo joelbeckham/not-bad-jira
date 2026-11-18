@@ -522,71 +522,160 @@ impl AppView {
     }
 
     fn tab_columns(&self, editor: &TabEditor, pending: bool, cx: &mut Context<Self>) -> Div {
+        let columns = &editor.draft.columns;
+        let available = crate::config::LIST_COLUMNS;
+        let visible =
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .children(columns.iter().enumerate().filter_map(|(index, column)| {
+                    let (field, label) = available
+                        .iter()
+                        .copied()
+                        .find(|(field, _)| field == column)?;
+                    let occurrence = columns[..index]
+                        .iter()
+                        .filter(|other| *other == column)
+                        .count();
+                    let id = format!("tab-column-{field}-{occurrence}");
+                    let checkbox = Self::column_checkbox(
+                        SharedString::from(id.clone()),
+                        field,
+                        label,
+                        true,
+                        pending || columns.iter().all(|other| other == field),
+                        cx,
+                    );
+                    let arrows = [-1isize, 1].into_iter().map(|step| {
+                        let earlier = step < 0;
+                        let name =
+                            format!("Move {label} {}", if earlier { "earlier" } else { "later" });
+                        let target = index
+                            .checked_add_signed(step)
+                            .filter(|&target| target < columns.len());
+                        Button::new(SharedString::from(format!("{id}-{step}")))
+                            .ghost()
+                            .small()
+                            .size(px(24.))
+                            .p_0()
+                            .icon(if earlier {
+                                gpui_kit::assets::IconName::ArrowLeft
+                            } else {
+                                gpui_kit::assets::IconName::ArrowRight
+                            })
+                            .accessibility_label(name.clone())
+                            .tooltip(name)
+                            .disabled(pending || target.is_none())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(editor) = this.tab_editor.as_mut()
+                                    && let Some(target) = target
+                                {
+                                    let columns = &mut editor.draft.columns;
+                                    if columns.get(index).is_some_and(|column| column == field)
+                                        && target < columns.len()
+                                    {
+                                        columns.swap(index, target);
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                    });
+                    Some(
+                        column_chip()
+                            .bg(rgb(0x20252e))
+                            .child(checkbox)
+                            .child(div().flex().items_center().gap_0p5().children(arrows)),
+                    )
+                }));
+        let hidden: Vec<_> = available
+            .into_iter()
+            .filter(|(field, _)| !columns.iter().any(|column| column == field))
+            .map(|(field, label)| {
+                column_chip()
+                    .text_color(rgb(0xa4afc0))
+                    .child(Self::column_checkbox(
+                        SharedString::from(format!("tab-column-{field}")),
+                        field,
+                        label,
+                        false,
+                        pending,
+                        cx,
+                    ))
+            })
+            .collect();
         div()
             .flex()
             .flex_col()
             .gap_2()
             .flex_shrink_0()
-            .child(muted("Columns"))
+            .child(muted("Visible columns"))
+            .child(visible)
+            .when(!hidden.is_empty(), |section| {
+                section.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .pt_1()
+                        .child(muted("Hidden columns"))
+                        .child(div().flex().flex_wrap().gap_2().children(hidden)),
+                )
+            })
+    }
+
+    fn column_checkbox(
+        id: SharedString,
+        field: &'static str,
+        label: &'static str,
+        checked: bool,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Checkbox {
+        let toggle = cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if let Some(editor) = this.tab_editor.as_mut() {
+                let columns = &mut editor.draft.columns;
+                if checked && columns.iter().any(|column| column != field) {
+                    columns.retain(|column| column != field);
+                } else if !checked && !columns.iter().any(|column| column == field) {
+                    columns.push(field.into());
+                }
+                cx.notify();
+            }
+        });
+        Checkbox::new(id)
+            .accessibility_label(label)
+            .checked(checked)
+            .disabled(disabled)
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(3.))
+            .border_1()
+            .border_color(gpui_kit::transparent_black())
+            .focus_visible(|style| style.border_color(rgb(0x79aaf9)))
+            .text_size(px(13.))
+            .when(!disabled, |checkbox| checkbox.cursor_pointer())
+            .when(disabled, |checkbox| checkbox.opacity(0.55))
             .child(
-                div().flex().flex_wrap().gap_x_4().gap_y_2().children(
-                    crate::config::LIST_COLUMNS
-                        .into_iter()
-                        .map(|(field, label)| {
-                            let columns = &editor.draft.columns;
-                            let checked = columns.iter().any(|column| column == field);
-                            let disabled = pending
-                                || (checked && columns.iter().all(|column| column == field));
-                            let toggle = cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                if let Some(editor) = this.tab_editor.as_mut() {
-                                    if checked {
-                                        editor.draft.columns.retain(|column| column != field);
-                                    } else {
-                                        editor.draft.columns.push(field.into());
-                                    }
-                                    cx.notify();
-                                }
-                            });
-                            Checkbox::new(SharedString::from(format!("tab-column-{field}")))
-                                .accessibility_label(label)
-                                .checked(checked)
-                                .disabled(disabled)
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded(px(3.))
-                                .border_1()
-                                .border_color(gpui_kit::transparent_black())
-                                .focus_visible(|style| style.border_color(rgb(0x79aaf9)))
-                                .text_size(px(13.))
-                                .when(!disabled, |checkbox| checkbox.cursor_pointer())
-                                .when(disabled, |checkbox| checkbox.opacity(0.55))
-                                .child(
-                                    div()
-                                        .size(px(14.))
-                                        .rounded(px(3.))
-                                        .border_1()
-                                        .border_color(rgb(if checked {
-                                            0x79aaf9
-                                        } else {
-                                            0x697688
-                                        }))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .when(checked, |indicator| {
-                                            indicator.bg(rgb(0x79aaf9)).child(
-                                                Icon::new(gpui_kit::assets::IconName::Check)
-                                                    .size(px(12.))
-                                                    .text_color(rgb(0x17212e)),
-                                            )
-                                        }),
-                                )
-                                .child(label)
-                                .on_change(move |_, event, window, cx| toggle(event, window, cx))
-                        }),
-                ),
+                div()
+                    .size(px(14.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(rgb(if checked { 0x79aaf9 } else { 0x697688 }))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(checked, |indicator| {
+                        indicator.bg(rgb(0x79aaf9)).child(
+                            Icon::new(gpui_kit::assets::IconName::Check)
+                                .size(px(12.))
+                                .text_color(rgb(0x17212e)),
+                        )
+                    }),
             )
+            .child(label)
+            .on_change(move |_, event, window, cx| toggle(event, window, cx))
     }
 
     fn tab_editor_actions(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -735,4 +824,16 @@ impl AppView {
             ))
             .into_any_element()
     }
+}
+
+fn column_chip() -> Div {
+    div()
+        .h(px(28.))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(rgb(0x394352))
 }
