@@ -1859,8 +1859,8 @@ impl AppView {
         let key_width = groups
             .iter()
             .flat_map(|group| &group.rows)
-            .map(|row| row.key.chars().count() as f32 * 9. + 48.)
-            .fold(164., f32::max);
+            .map(|row| row.key.chars().count() as f32 * 8. + 36.)
+            .fold(124., f32::max);
         let navigation = self
             .related_navigation
             .as_ref()
@@ -2087,6 +2087,13 @@ impl AppView {
             .as_str()
             .unwrap_or("Loading…")
             .to_string();
+        let mut status = div().w(px(40.)).flex_shrink_0().flex().justify_center();
+        if issue.fields.get("status").is_some() {
+            status = status.child(crate::status::icon(
+                &issue.fields["status"],
+                SharedString::from(format!("{id}-status")),
+            ));
+        }
         let mut content = div()
             .w_full()
             .min_w_0()
@@ -2100,6 +2107,7 @@ impl AppView {
                     .flex_shrink_0()
                     .child(self.issue_key(issue, true, window, cx)),
             )
+            .child(status)
             .child(
                 div()
                     .id(SharedString::from(format!("{id}-summary")))
@@ -2116,14 +2124,6 @@ impl AppView {
                     })
                     .child(summary.clone()),
             );
-        let mut status = div().w(px(52.)).flex_shrink_0().flex().justify_center();
-        if issue.fields.get("status").is_some() {
-            status = status.child(crate::status::icon(
-                &issue.fields["status"],
-                SharedString::from(format!("{id}-status")),
-            ));
-        }
-        content = content.child(status);
         let mut assignee = div()
             .w(px(160.))
             .pr_3()
