@@ -22,6 +22,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc, time::Duratio
 #[path = "tab_ui.rs"]
 mod tab_ui;
 use tab_ui::{TabEditor, TabSave};
+#[path = "parent_ui.rs"]
+mod parent_ui;
 
 type FieldBounds = Rc<RefCell<HashMap<(String, String), Bounds<Pixels>>>>;
 
@@ -53,6 +55,7 @@ enum Message {
     Related(u64, String, u64, Result<Vec<Issue>, String>),
     TabPreview(u64, Result<(Vec<Issue>, bool), String>),
     TabsSaved(Result<(), String>),
+    Parents(Vec<String>, Option<Vec<crate::jira::ParentDetails>>),
 }
 #[derive(Clone)]
 struct Sender {
@@ -67,6 +70,7 @@ impl Sender {
 pub struct AppView {
     attachments: crate::attachments::Previews,
     avatars: crate::avatar::AvatarCache,
+    parents: parent_ui::Parents,
     focus: FocusHandle,
     config: Option<Config>,
     client: Option<Client>,
@@ -179,6 +183,7 @@ impl AppView {
             inputs,
             editor,
             rich_edit: true,
+            parents: Default::default(),
             summary_input,
             tab: 0,
             tab_editor: None,
@@ -367,6 +372,7 @@ impl AppView {
     }
     fn connect_existing(&mut self) {
         self.action_notice = None;
+        self.parents = Default::default();
         self.connecting = true;
         self.tx.epoch += 1;
         let c = self.config.clone().unwrap();
@@ -403,6 +409,7 @@ impl AppView {
             return;
         }
         let token = values[2].clone();
+        self.parents = Default::default();
         self.connecting = true;
         self.tx.epoch += 1;
         let tx = self.tx.clone();
@@ -493,6 +500,15 @@ impl AppView {
                     }
                 }
                 Message::TabsSaved(result) => self.finish_tab_save(result, cx),
+                Message::Parents(keys, result) => {
+                    let selected = self.keys(cx).get(self.selected).cloned();
+                    self.apply_parents(keys, result);
+                    if let Some(key) = selected
+                        && let Some(index) = self.keys(cx).iter().position(|row| row == &key)
+                    {
+                        self.selected = index;
+                    }
+                }
                 Message::Connected(Ok((client, user))) => {
                     self.connecting = false;
                     self.current_user = Some(user.clone());
@@ -749,6 +765,7 @@ impl AppView {
             self.connect_existing();
             cx.notify();
         }
+        self.request_parents();
     }
     fn keys(&self, cx: &App) -> Vec<String> {
         let query = self.inputs[4].read(cx).value().to_string().to_lowercase();
@@ -775,13 +792,15 @@ impl AppView {
             .unwrap_or_default();
         let (field, mode) = self.sort.get(&self.tab).unwrap_or(&default);
         if !field.is_empty() && *mode < 2 {
-            keys.sort_by_key(|k| {
+            keys.sort_by_cached_key(|k| {
                 self.store
                     .issues
                     .get(k)
                     .map(|i| {
                         if field == "key" {
                             i.key.clone()
+                        } else if field == "parent" {
+                            self.parent_sort(i)
                         } else {
                             i.field(if field == "type" { "issuetype" } else { field })
                         }
@@ -2486,6 +2505,9 @@ impl AppView {
         let issues=[("NBJ-101","Build the native issue list","In Progress","High","Alex Morgan"),("NBJ-102","Add keyboard navigation","To Do","Medium","Sam Rivera"),("NBJ-103","Cache recent issues for instant startup","Done","Low","Alex Morgan"),("NBJ-104","Preserve rich text, inline attachments, and unsupported Jira content when editing descriptions in Markdown","To Do","Highest","Alexandra Morgan-Rivera"),("PLATFORM-12345","Review empty states","To Do","Lowest","Unassigned")].iter().enumerate().map(|(i,(key,summary,status,priority,assignee))|Issue{key:(*key).into(),fields:json!({"summary":summary,"status":{"name":status},"priority":{"name":priority},"issuetype":{"name":(["Task","Story","Bug","Epic","Sub-task"][i]),"subtask":i==4},"assignee":{"displayName":assignee},"description":null})}).collect();
         self.store.set_tab(0, issues);
         self.demo_related();
+        if std::env::args().any(|arg| arg == "--demo-parents") {
+            self.demo_parents();
+        }
         if std::env::args().any(|arg| arg == "--demo-statuses") {
             self.store.issues.get_mut("NBJ-102").unwrap().fields["status"] =
                 json!({"name":"Waiting","statusCategory":{"key":"indeterminate"}});
@@ -2839,6 +2861,7 @@ impl AppView {
                 self.pending_config = None;
                 self.current_user = None;
                 self.client = None;
+                self.parents = Default::default();
                 self.config = None;
                 self.demo = false;
                 self.store = Store::default();
@@ -3076,6 +3099,7 @@ fn cell(text: String, field: &str) -> Div {
             match field {
                 "key" => 148.,
                 "assignee" | "reporter" => 160.,
+                "parent" => parent_ui::WIDTH,
                 _ => 130.,
             },
         )
@@ -3444,6 +3468,9 @@ impl Render for AppView {
                                                 .bg(rgb(if selected { 0x253348 } else { 0x191c23 }))
                                                 .cursor_pointer()
                                                 .children(columns.iter().map(|field| {
+                                                    if field == "parent" {
+                                                        return this.parent_cell(issue, window, cx).into_any_element();
+                                                    }
                                                     if field == "key" {
                                                         let show_type =
                                                             !columns.iter().any(|field| {

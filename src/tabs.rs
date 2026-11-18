@@ -42,8 +42,15 @@ impl Tab {
 }
 
 pub fn is_epic(issue: &Issue) -> bool {
-    issue.fields["issuetype"]["hierarchyLevel"].as_i64() == Some(1)
-        || issue.field("issuetype").eq_ignore_ascii_case("epic")
+    is_epic_type(&issue.fields["issuetype"])
+}
+
+pub fn is_epic_type(kind: &serde_json::Value) -> bool {
+    kind["hierarchyLevel"].as_i64() == Some(1)
+        || kind["name"]
+            .as_str()
+            .or_else(|| kind.as_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("epic"))
 }
 
 impl Change {

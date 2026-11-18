@@ -1,10 +1,11 @@
 use super::*;
 use crate::{config::Tab, tabs::Change};
-use gpui_kit::component::{input::Textarea, menu::PopupMenu};
+use gpui_kit::base::Checkbox;
+use gpui_kit::component::{Icon, input::Textarea, menu::PopupMenu};
 
 pub(super) struct TabEditor {
     index: Option<usize>,
-    original: Tab,
+    draft: Tab,
     rename: bool,
     pub preview: Option<(Vec<Issue>, bool)>,
     pub preview_loading: bool,
@@ -52,7 +53,7 @@ impl AppView {
         self.tab_preview_request += 1;
         self.tab_editor = Some(TabEditor {
             index,
-            original: tab,
+            draft: tab,
             rename,
             preview: None,
             preview_loading: false,
@@ -149,7 +150,7 @@ impl AppView {
         let Some(editor) = self.tab_editor.as_mut() else {
             return;
         };
-        let mut tab = editor.original.clone();
+        let mut tab = editor.draft.clone();
         tab.label = self.tab_name.read(cx).value().trim().to_string();
         if tab.label.is_empty() {
             editor.error = Some("Enter a tab name".into());
@@ -446,7 +447,7 @@ impl AppView {
             "New tab"
         };
         let heading = if editor.index.is_some() {
-            format!("{} / {title}", editor.original.label)
+            format!("{} / {title}", editor.draft.label)
         } else {
             title.into()
         };
@@ -510,6 +511,7 @@ impl AppView {
                         .child(muted("JQL"))
                         .child(jql),
                 )
+                .child(self.tab_columns(editor, pending, cx))
                 .child(self.tab_preview_header(cx))
                 .child(self.tab_preview_results(cx));
         }
@@ -517,6 +519,74 @@ impl AppView {
             form = form.child(div().text_color(rgb(0xf0a5a5)).child(error.clone()));
         }
         form.child(self.tab_editor_actions(cx)).into_any_element()
+    }
+
+    fn tab_columns(&self, editor: &TabEditor, pending: bool, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_shrink_0()
+            .child(muted("Columns"))
+            .child(
+                div().flex().flex_wrap().gap_x_4().gap_y_2().children(
+                    crate::config::LIST_COLUMNS
+                        .into_iter()
+                        .map(|(field, label)| {
+                            let columns = &editor.draft.columns;
+                            let checked = columns.iter().any(|column| column == field);
+                            let disabled = pending
+                                || (checked && columns.iter().all(|column| column == field));
+                            let toggle = cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if let Some(editor) = this.tab_editor.as_mut() {
+                                    if checked {
+                                        editor.draft.columns.retain(|column| column != field);
+                                    } else {
+                                        editor.draft.columns.push(field.into());
+                                    }
+                                    cx.notify();
+                                }
+                            });
+                            Checkbox::new(SharedString::from(format!("tab-column-{field}")))
+                                .accessibility_label(label)
+                                .checked(checked)
+                                .disabled(disabled)
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(gpui_kit::transparent_black())
+                                .focus_visible(|style| style.border_color(rgb(0x79aaf9)))
+                                .text_size(px(13.))
+                                .when(!disabled, |checkbox| checkbox.cursor_pointer())
+                                .when(disabled, |checkbox| checkbox.opacity(0.55))
+                                .child(
+                                    div()
+                                        .size(px(14.))
+                                        .rounded(px(3.))
+                                        .border_1()
+                                        .border_color(rgb(if checked {
+                                            0x79aaf9
+                                        } else {
+                                            0x697688
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(checked, |indicator| {
+                                            indicator.bg(rgb(0x79aaf9)).child(
+                                                Icon::new(gpui_kit::assets::IconName::Check)
+                                                    .size(px(12.))
+                                                    .text_color(rgb(0x17212e)),
+                                            )
+                                        }),
+                                )
+                                .child(label)
+                                .on_change(move |_, event, window, cx| toggle(event, window, cx))
+                        }),
+                ),
+            )
     }
 
     fn tab_editor_actions(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -565,7 +635,7 @@ impl AppView {
             .gap_3()
             .flex_shrink_0()
             .pt_2()
-            .child(div().flex_1().child(muted("PREVIEW")))
+            .child(div().flex_1().child(muted("Preview")))
             .child(muted(count))
             .child(
                 Button::new("preview-tab")

@@ -29,6 +29,20 @@ pub struct Tab {
     #[serde(default)]
     pub sort: String,
 }
+pub const LIST_COLUMNS: [(&str, &str); 12] = [
+    ("key", "Key"),
+    ("summary", "Summary"),
+    ("status", "Status"),
+    ("priority", "Priority"),
+    ("assignee", "Assignee"),
+    ("reporter", "Reporter"),
+    ("type", "Type"),
+    ("project", "Project"),
+    ("created", "Created"),
+    ("updated", "Updated"),
+    ("duedate", "Due date"),
+    ("parent", "Parent"),
+];
 fn ttl() -> String {
     "5m".into()
 }
@@ -71,13 +85,9 @@ impl Config {
                 bail!("Each tab needs a label and exactly one of jql or filter_id");
             }
             if t.columns.is_empty()
-                || t.columns.iter().any(|c| {
-                    ![
-                        "key", "summary", "status", "priority", "assignee", "reporter", "type",
-                        "project", "created", "updated", "duedate",
-                    ]
-                    .contains(&c.as_str())
-                })
+                || t.columns
+                    .iter()
+                    .any(|c| !LIST_COLUMNS.iter().any(|(field, _)| field == c))
             {
                 bail!("Tab {} has empty or unsupported columns", t.label);
             }

@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::{Arc, OnceLock};
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Issue {
     pub key: String,
@@ -12,6 +13,10 @@ pub struct Issue {
 pub struct CreatedIssue {
     pub issue: Issue,
     pub detail_error: Option<String>,
+}
+pub struct ParentDetails {
+    pub issue: Issue,
+    pub color: Option<String>,
 }
 impl Issue {
     pub fn list_field(&self, name: &str) -> String {
@@ -42,6 +47,7 @@ pub struct Client {
     pub config: Config,
     auth: String,
     agent: ureq::Agent,
+    parent_color_fields: Arc<OnceLock<[Option<String>; 2]>>,
 }
 impl Client {
     pub fn new(config: Config, token: String) -> Self {
@@ -59,20 +65,93 @@ impl Client {
             config,
             auth,
             agent,
+            parent_color_fields: Default::default(),
         }
     }
     fn url(&self, path: &str) -> String {
         format!("{}/rest/api/3/{}", self.config.jira.base_url, path)
     }
     pub fn get(&self, path: &str) -> Result<Value> {
+        self.get_json(&self.url(path))
+    }
+
+    fn get_json(&self, address: &str) -> Result<Value> {
         Ok(checked(
             self.agent
-                .get(self.url(path))
+                .get(address)
                 .header("Authorization", &self.auth)
                 .call()?,
         )?
         .body_mut()
         .read_json()?)
+    }
+
+    pub fn parent_details(&self, keys: &[String]) -> Result<Vec<ParentDetails>> {
+        anyhow::ensure!(
+            keys.iter().all(|key| crate::related::valid_key(key)),
+            "Invalid parent key"
+        );
+        if self.parent_color_fields.get().is_none()
+            && let Ok(fields) = self.get("field")
+            && let Some(fields) = fields.as_array()
+        {
+            let ids = ["Issue color", "Epic Color"].map(|name| {
+                fields.iter().find_map(|field| {
+                    let id = field["id"].as_str()?;
+                    let field_name = field["name"].as_str()?;
+                    (field_name.eq_ignore_ascii_case(name) && id.starts_with("customfield_"))
+                        .then(|| id.to_owned())
+                })
+            });
+            let _ = self.parent_color_fields.set(ids);
+        }
+        let color_fields = self
+            .parent_color_fields
+            .get()
+            .into_iter()
+            .flatten()
+            .flatten();
+        let fields: Vec<_> = ["summary", "issuetype"]
+            .into_iter()
+            .chain(color_fields.clone().map(String::as_str))
+            .collect();
+        let query = format!(
+            "key in ({})",
+            keys.iter()
+                .map(|key| format!("\"{key}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let issues = self.search_fields(&query, &fields)?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| keys.contains(&issue.key))
+            .map(|issue| {
+                let color = if crate::tabs::is_epic(&issue) {
+                    color_fields
+                        .clone()
+                        .find_map(|field| {
+                            let color = &issue.fields[field];
+                            color
+                                .as_str()
+                                .or_else(|| color["key"].as_str())
+                                .or_else(|| color["value"].as_str())
+                                .filter(|color| !color.trim().is_empty())
+                                .map(str::to_owned)
+                        })
+                        .or_else(|| {
+                            let site = self.config.jira.base_url.trim_end_matches('/');
+                            let data = self
+                                .get_json(&format!("{site}/rest/agile/1.0/epic/{}", issue.key))
+                                .ok()?;
+                            data["color"]["key"].as_str().map(str::to_owned)
+                        })
+                } else {
+                    None
+                };
+                ParentDetails { issue, color }
+            })
+            .collect())
     }
 
     pub fn avatar_bytes(&self, address: &str) -> Result<Vec<u8>> {
@@ -222,10 +301,36 @@ impl Client {
     }
 
     fn search_jql(&self, jql: &str) -> Result<Vec<Issue>> {
+        let mut issues = self.search_fields(
+            jql,
+            &[
+                "summary",
+                "status",
+                "priority",
+                "assignee",
+                "reporter",
+                "issuetype",
+                "project",
+                "created",
+                "updated",
+                "duedate",
+                "parent",
+            ],
+        )?;
+        // The full list request owns parent data even if Jira omits an empty value.
+        for issue in &mut issues {
+            if let Some(fields) = issue.fields.as_object_mut() {
+                fields.entry("parent").or_insert(Value::Null);
+            }
+        }
+        Ok(issues)
+    }
+
+    fn search_fields(&self, jql: &str, fields: &[&str]) -> Result<Vec<Issue>> {
         let mut issues = Vec::new();
         let mut token = Value::Null;
         loop {
-            let mut body = json!({"jql":jql,"maxResults":100,"fields":["summary","status","priority","assignee","reporter","issuetype","project","created","updated","duedate","parent"]});
+            let mut body = json!({"jql":jql,"maxResults":100,"fields":fields});
             if !token.is_null() {
                 body["nextPageToken"] = token;
             }
@@ -393,6 +498,68 @@ mod tests {
         );
         server.join().unwrap();
     }
+
+    #[test]
+    fn parent_details_use_issue_color_and_fall_back_to_the_epic_endpoint() {
+        let (url, server) = mock(vec![
+            (
+                200,
+                json!([{"id":"customfield_12345","name":"Issue color"}]),
+            ),
+            (
+                200,
+                json!({"isLast":true,"issues":[
+                    {"key":"T-1","fields":{"issuetype":{"hierarchyLevel":1},"customfield_12345":"teal"}},
+                    {"key":"T-2","fields":{"issuetype":{"name":"Epic"}}},
+                    {"key":"T-3","fields":{"issuetype":{"name":"Task"},"customfield_12345":"teal"}}
+                ]}),
+            ),
+            (200, json!({"color":{"key":"color_4"}})),
+        ]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        let keys = ["T-1", "T-2", "T-3", "T-4"].map(String::from);
+        let details = client.parent_details(&keys).unwrap();
+        assert_eq!(details.len(), 3);
+        assert_eq!(details[0].color.as_deref(), Some("teal"));
+        assert_eq!(details[1].color.as_deref(), Some("color_4"));
+        assert!(details[2].color.is_none());
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["request"], "GET /rest/api/3/field HTTP/1.1");
+        assert_eq!(
+            requests[1]["body"]["fields"],
+            json!(["summary", "issuetype", "customfield_12345"])
+        );
+        assert_eq!(
+            requests[2]["request"],
+            "GET /rest/agile/1.0/epic/T-2 HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn list_refresh_clears_a_parent_omitted_from_the_response() {
+        let (url, server) = mock(vec![(
+            200,
+            json!({"isLast":true,"issues":[
+                {"key":"T-1","fields":{"summary":"No parent"}}
+            ]}),
+        )]);
+        let client = Client::new(
+            Config::initial(url, "test@example.com".into(), "T".into()),
+            "test-token".into(),
+        );
+        let mut store = crate::store::Store::default();
+        store.merge_issue(Issue {
+            key: "T-1".into(),
+            fields: json!({"parent":{"key":"T-2"}}),
+        });
+        store.set_tab(0, client.search(0).unwrap());
+        assert_eq!(store.issues["T-1"].fields.get("parent"), Some(&Value::Null));
+        server.join().unwrap();
+    }
+
     #[test]
     fn search_uses_token_pagination() {
         let (url, server) = mock(vec![
