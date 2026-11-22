@@ -262,8 +262,7 @@ even while the Markdown editor has focus, discards unsaved typing as requested,
 and restores focus to the same issue view. Pending writes retain their editor;
 open field pickers keep their own Escape behavior. The app overrides the editor's
 Dismiss key binding because it consumes Escape before raw key handlers.
-Native screenshots are `design/reviews/editor-escape-*.png`. Claude found no
-visual changes needed; its optional discard confirmation was not adopted because
+Claude found no visual changes needed; its optional discard confirmation was not adopted because
 the requested behavior is single-Escape cancellation, matching the Cancel action.
 
 The command palette keeps its search input focused while Up/Down select matching
@@ -284,9 +283,8 @@ the workspace handler can reclaim focus. The whole bordered area uses the text
 cursor; padding and blank-space clicks restore the existing caret, while text
 clicks keep the editor's own caret hit testing. Native checks (2026-11-16) cover
 defocus/refocus on text, padding and blank space, subsequent typing, and Escape
-cancellation followed by reopening the original description. Screenshots are
-`design/reviews/editor-refocus-*.png`. Claude reviewed the focus states and found
-no visual changes necessary. All 47 tests and Clippy pass.
+cancellation followed by reopening the original description. Claude reviewed the
+focus states and found no visual changes necessary. All 47 tests and Clippy pass.
 
 Rich editor and attachments (2026-11-16): description/comment editors use Zorite's
 native Markdown styling with a Rich / Markdown toggle sharing one buffer. Switching
@@ -300,14 +298,13 @@ is not implemented. Image fetching uses a bounded worker queue, account-specific
 memory entries, size-limited decoding and redirects without cross-origin credentials.
 Use `--demo --demo-rich-editor` for the native preview fixture.
 Native checks cover both mode states, draft retention across toggles, readable IP
-lines, media chips, contained previews and matching file cards. Screenshots:
-`design/reviews/rich-editor.png`, `raw-editor.png`, `editor-toggle-draft.png`.
+lines, media chips, contained previews and matching file cards.
 Both Claude design reviews completed; substantive active-state, card and form
 layout findings were applied. Final validation: 51 tests pass; Clippy passes with
 `-D warnings`. Attachment HTTP fixtures cover the canonical endpoint and invalid
 IDs; shared redirect tests cover credential isolation. Live authenticated attachment
 downloads and Jira writes were not performed.
-The final release build was launched and checked natively; see design/reviews/rich-editor-release.png. The existing user process was preserved.
+The final release build was launched and checked natively. The existing user process was preserved.
 
 Tab management (2026-11-16): right-click tabs to edit, rename, duplicate or delete;
 right-click empty tab-strip space to create a tab. Editing has Name and multiline

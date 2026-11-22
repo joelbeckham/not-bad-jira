@@ -2517,7 +2517,7 @@ impl AppView {
             issue.fields["description"] = json!({"type":"doc","version":1,"content":[
                 {"type":"heading","attrs":{"level":2},"content":[{"type":"text","text":"Release checklist"}]},
                 {"type":"paragraph","content":[{"type":"text","text":"Review the screenshots","marks":[{"type":"strong"}]}]},
-                {"type":"paragraph","content":[{"type":"text","text":"34.216.59.33"},{"type":"hardBreak"},{"type":"text","text":"54.69.240.210"}]},
+                {"type":"paragraph","content":[{"type":"text","text":"192.0.2.10"},{"type":"hardBreak"},{"type":"text","text":"198.51.100.20"}]},
                 {"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"demo-media","type":"file","collection":""}}]}
             ]});
             issue.fields["attachment"] = json!([
@@ -2528,8 +2528,8 @@ impl AppView {
         if std::env::args().any(|arg| arg == "--demo-description") {
             self.store.issues.get_mut("NBJ-101").unwrap().fields["description"] = json!({
                 "type":"doc", "version":1, "content":[
-                    {"type":"paragraph","content":[{"type":"text","text":"Invited James to app.bombbomb.com repo. GitHub username: at-1337-r"}]},
-                    {"type":"paragraph","content":[{"type":"text","text":"https://github.com/bombbomb/app.bombbomb.com/settings/access"}]}
+                    {"type":"paragraph","content":[{"type":"text","text":"Invited Alex to the demo repo. GitHub username: sample-user"}]},
+                    {"type":"paragraph","content":[{"type":"text","text":"https://example.com/demo-org/demo-app/settings/access"}]}
                 ]
             });
         }

@@ -559,7 +559,7 @@ mod tests {
     }
     #[test]
     fn entered_lines_survive_save_and_reopen() {
-        let input = "34.216.59.33\n54.69.240.210\n35.90.42.16\n52.27.217.135\n34.215.163.132";
+        let input = "192.0.2.10\n198.51.100.20\n203.0.113.30\n192.0.2.40\n198.51.100.50";
         let saved = Document::default().to_adf(input).unwrap();
         assert_eq!(
             saved["content"][0]["content"]
@@ -640,8 +640,8 @@ mod tests {
     }
     #[test]
     fn editor_keeps_urls_and_prose_readable() {
-        let text = "Invited James to app.bombbomb.com repo. GitHub username: at-1337-r";
-        let url = "https://github.com/bombbomb/app.bombbomb.com/settings/access";
+        let text = "Invited Alex to the demo repo. GitHub username: sample-user";
+        let url = "https://example.com/demo-org/demo-app/settings/access";
         let original = json!({"type":"doc","version":1,"content":[
             {"type":"paragraph","content":[{"type":"text","text":text}]},
             {"type":"paragraph","content":[{"type":"text","text":url}]}
